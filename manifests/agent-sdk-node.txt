@@ -1,0 +1,6 @@
+# Dependencies of templates/node-agent (installed per project, not globally).
+@anthropic-ai/sdk
+@anthropic-ai/claude-agent-sdk
+@openai/agents
+@modelcontextprotocol/sdk
+zod

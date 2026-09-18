@@ -1,0 +1,11 @@
+# Installed into ~/.venvs/agents (shared scratch venv). Projects pin their own copies.
+anthropic
+claude-agent-sdk
+openai
+openai-agents
+google-adk
+google-genai
+mcp
+litellm
+ipykernel
+python-dotenv

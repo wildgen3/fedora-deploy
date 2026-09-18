@@ -1,0 +1,17 @@
+{
+  "name": "node-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Starter: Claude API + Claude Agent SDK + OpenAI Agents + MCP (copy this folder, then `npm install`)",
+  "scripts": {
+    "chat": "node chat.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest",
+    "@anthropic-ai/sdk": "latest",
+    "@modelcontextprotocol/sdk": "latest",
+    "@openai/agents": "latest",
+    "zod": "latest"
+  }
+}

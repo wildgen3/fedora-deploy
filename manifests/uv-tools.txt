@@ -1,0 +1,7 @@
+# uv tool install <line>
+google-adk
+google-agents-cli
+llm
+ruff
+pytest
+sqlite-utils

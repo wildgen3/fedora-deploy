@@ -1,0 +1,6 @@
+# Extended regexes. inventory.sh FAILS if any installed package or enabled repo matches.
+^nobara
+nobara
+pikaos
+gloriouseggroll
+^snapd

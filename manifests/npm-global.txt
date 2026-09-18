@@ -1,0 +1,3 @@
+# npm install -g (under nvm's Node 22). Claude Code uses its native installer instead.
+@openai/codex
+@modelcontextprotocol/inspector

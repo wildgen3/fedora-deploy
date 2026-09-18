@@ -1,0 +1,164 @@
+# Fedora 44 (fedora / updates / fedora-cisco-openh264). One package per line; '#' comments.
+# Installed by scripts/deploy-system.sh. Verified against F44 metadata 2026-09-18.
+
+## --- core / admin ---
+dnf5-plugins
+git
+curl
+wget2-wget
+rsync
+unzip
+zip
+7zip
+tree
+lsof
+htop
+pciutils
+usbutils
+lm_sensors
+smartmontools
+nvme-cli
+ethtool
+mtr
+bind-utils
+whois
+traceroute
+vim-enhanced
+bash-completion
+plocate
+fastfetch
+openssh-server
+firewall-config
+
+## --- disk / recovery ---
+testdisk
+ddrescue
+gparted
+ntfs-3g
+exfatprogs
+hfsplus-tools
+btrfs-progs
+compsize
+
+## --- serial / hardware ---
+screen
+minicom
+i2c-tools
+openrgb
+libusb-compat-0.1
+webkit2gtk4.1
+gtk3
+
+## --- snapshots (replaces timeshift) ---
+snapper
+btrfs-assistant
+
+## --- KDE extras ---
+kde-connect
+kde-partitionmanager
+filelight
+kcalc
+okular
+gwenview
+spectacle
+ark
+kate
+
+## --- multimedia / creative ---
+blender
+kdenlive
+inkscape
+gimp
+krita
+libreoffice
+vlc
+mpv
+openh264  # fedora-cisco-openh264 repo
+gstreamer1-plugin-openh264
+mozilla-openh264
+
+## --- gaming (host side; Steam is Flatpak, so no i686 host libs needed) ---
+steam-devices
+gamemode
+gamescope
+mangohud
+goverlay
+vkBasalt
+lutris
+protontricks
+winetricks
+vulkan-tools
+mesa-vulkan-drivers
+
+## --- dev: languages / build ---
+@development-tools
+gcc
+gcc-c++
+make
+cmake
+python3-pip
+python3-devel
+python3.12
+python3.13
+uv
+pipx
+nodejs22
+golang
+rustup
+sqlite
+postgresql
+
+## --- dev: CLI ---
+gh
+ripgrep
+fzf
+bat
+eza
+zoxide
+fd-find
+jq
+yq
+btop
+tmux
+neovim
+direnv
+just
+git-delta
+tealdeer
+glow
+hyperfine
+atuin
+chezmoi
+
+## --- containers / cloud / IaC ---
+podman
+podman-compose
+toolbox
+distrobox
+helm
+k9s
+opentofu
+trivy
+gitleaks
+pre-commit
+ShellCheck
+shfmt
+httpie
+
+## --- local AI (GPU handling: see deploy-system.sh gpu section) ---
+ramalama
+ollama
+llama-cpp
+
+## --- system / ops ---
+@virtualization
+virt-manager
+wireshark
+nmap
+restic
+syncthing
+
+## --- deploy kit tooling (lets any machine rebuild the ISO) ---
+lorax
+pykickstart
+xorriso

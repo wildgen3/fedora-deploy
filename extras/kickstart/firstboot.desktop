@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Fedora Deploy - first login setup
+Comment=Installs per-user apps and tools (runs once per user)
+Exec=/opt/fedora-deploy/extras/kickstart/firstboot-launch.sh
+Icon=system-software-install
+X-KDE-autostart-phase=2
+NoDisplay=true

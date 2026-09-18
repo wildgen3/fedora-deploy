@@ -1,0 +1,26 @@
+# Flathub, installed --user by deploy-user.sh. Verified on Flathub 2026-09-18.
+## gaming (Steam is the Flatpak build)
+com.valvesoftware.Steam
+com.heroicgameslauncher.hgl
+com.vysp3r.ProtonPlus
+## apps
+com.discordapp.Discord
+com.moonlight_stream.Moonlight
+com.orcaslicer.OrcaSlicer
+com.spotify.Client
+dev.deedles.Trayscale
+io.github.prateekmedia.pstube
+io.mango3d.LycheeSlicer
+org.freecad.FreeCAD
+org.remmina.Remmina
+## OBS (replaces nobara-pikaos obs-studio + plugin RPMs)
+com.obsproject.Studio
+com.obsproject.Studio.Plugin.BackgroundRemoval
+com.obsproject.Studio.Plugin.OBSVkCapture
+com.obsproject.Studio.Plugin.DistroAV
+com.obsproject.Studio.Plugin.AitumMultistream
+com.obsproject.Studio.Plugin.VerticalCanvas
+com.obsproject.Studio.Plugin.SourceRecord
+## new
+io.podman_desktop.PodmanDesktop
+com.github.tchx84.Flatseal

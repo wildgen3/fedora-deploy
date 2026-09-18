@@ -1,0 +1,2 @@
+# Removed after install if present. Duplicates of Flatpak/RPM choices and unwanted defaults.
+snapd

@@ -1,0 +1,12 @@
+ms-python.python
+ms-python.vscode-pylance
+charliermarsh.ruff
+ms-toolsai.jupyter
+anthropic.claude-code
+openai.chatgpt
+eamodio.gitlens
+hashicorp.terraform
+redhat.vscode-yaml
+ms-azuretools.vscode-containers
+ms-vscode-remote.remote-ssh
+googlecloudtools.cloudcode

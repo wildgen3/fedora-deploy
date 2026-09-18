@@ -1,0 +1,4 @@
+# Installed at the branch matching Steam's runtime (detected at install time).
+org.freedesktop.Platform.VulkanLayer.MangoHud
+org.freedesktop.Platform.VulkanLayer.gamescope
+org.freedesktop.Platform.VulkanLayer.vkBasalt

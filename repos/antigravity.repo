@@ -1,0 +1,6 @@
+[antigravity-rpm]
+name=Antigravity RPM Repository
+baseurl=https://us-central1-yum.pkg.dev/projects/antigravity-auto-updater-dev/antigravity-rpm
+enabled=1
+# Vendor publishes this repo unsigned (same as their official instructions).
+gpgcheck=0
