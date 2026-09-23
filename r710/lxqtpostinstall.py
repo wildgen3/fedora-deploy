@@ -25,8 +25,9 @@ Outline of what it does, in order:
   6. Time: America/Chicago, NTP on, 24-hour time for the command line,
      the LXQt session and the panel clock (checked first, changed only if needed).
   7. LXQt look and speed: dark mode (LXQt, Qt and GTK apps), and xfwm4 as
-     the window manager with compositing off (responsive over RDP) and
-     drag-to-edge window tiling on.
+     the window manager: drag-to-edge window tiling, Alt+Tab with window
+     thumbnails, and light compositing (no shadows, no vsync) to stay
+     responsive over RDP.
   8. Remote desktop: xrdp + xorgxrdp, enabled and verified to start at boot,
      each RDP login gets its own LXQt desktop, network buffers tuned to cut
      mouse lag. No screen lock and no idle power actions.
@@ -130,15 +131,24 @@ net.core.rmem_max = 12582912
 
 # xfwm4 settings (xfconf channel "xfwm4", under /general), checked against
 # xfwm4's own defaults file before writing:
-#   use_compositing off: no shadows/fades/transparency drawn on the CPUs.
 #   tile_on_move on: drag a window to the left/right edge to fill that half,
 #     to the top to maximize.
 #   wrap_windows off: otherwise dragging to an edge flips to the next
 #     workspace instead of tiling.
 #   snap_to_border on: windows snap cleanly against the screen edges.
+#   use_compositing on + cycle_preview on: Alt+Tab shows window thumbnails.
+#     Thumbnails need the compositor, so it stays on but kept cheap for the
+#     R710 (no GPU, everything drawn by the CPUs and sent over RDP):
+#   show_frame_shadow / show_popup_shadow / show_dock_shadow off: no shadows.
+#   vblank_mode off: don't wait for screen refresh; there's no GPU to sync to.
+#   cycle_tabwin_mode 0: Alt+Tab shows a grid of thumbnails (1 is a text list).
+# If the mouse gets laggy over RDP again, set use_compositing to false:
+# Alt+Tab then shows icons instead of thumbnails.
 XFWM4_DEFAULTS = "/usr/share/xfwm4/defaults"
-XFWM4_SETTINGS = {"use_compositing": "false", "tile_on_move": "true",
-                  "wrap_windows": "false", "snap_to_border": "true"}
+XFWM4_SETTINGS = {"tile_on_move": "true", "wrap_windows": "false", "snap_to_border": "true",
+                  "use_compositing": "true", "cycle_preview": "true", "cycle_tabwin_mode": "0",
+                  "show_frame_shadow": "false", "show_popup_shadow": "false",
+                  "show_dock_shadow": "false", "vblank_mode": "off"}
 
 # LXQt ships these under /usr/share/lxqt (themes/<name>, palettes/<name>).
 LXQT_SHARE = Path("/usr/share/lxqt")
@@ -972,9 +982,11 @@ def configure_xfwm4():
             ok = False
             continue
         prop = ["xfconf-query", "-c", "xfwm4", "-p", f"/general/{key}"]
+        # xfconf needs the value's type when creating a property.
+        kind = "bool" if value in ("true", "false") else "int" if value.isdigit() else "string"
         if output_of(prop) == value:
             say(f"xfwm4 {key} already {value}")
-        elif run(prop + ["-n", "-t", "bool", "-s", value]).returncode != 0:
+        elif run(prop + ["-n", "-t", kind, "-s", value]).returncode != 0:
             failed(f"xfwm4 {key}={value}")
             ok = False
     return ok
@@ -1018,14 +1030,15 @@ def step7_lxqt_desktop():
             failed("gsettings color-scheme prefer-dark")
 
     # --- Window manager: xfwm4 (Xfce's). It's one of LXQt's supported
-    # window managers, stays light with compositing off (the R710 has no real
-    # GPU, so effects are drawn by the CPUs and then sent over RDP), and has
-    # drag-to-edge tiling built in, which Openbox doesn't.
+    # window managers and has drag-to-edge tiling and Alt+Tab thumbnails
+    # built in, which Openbox doesn't. See XFWM4_SETTINGS for how it's
+    # kept light for the R710.
     install_packages(["xfwm4"], "xfwm4 window manager")
     if (shutil.which("xfwm4") or DRY_RUN) and verified("lxqt-session", ["window_manager"], "window manager"):
         FACTS["wm"] = set_ini(HOME / ".config/lxqt/session.conf", "General", {"window_manager": "xfwm4"})
     FACTS["xfwm4_tuned"] = configure_xfwm4()
-    # Standalone compositors that some setups autostart. A same-named file in
+    # Standalone compositors that some setups autostart would clash with
+    # xfwm4's own. A same-named file in
     # ~/.config/autostart with Hidden=true switches one off for this user.
     for name in autostart_entries(["picom", "compton", "xcompmgr"]):
         write_user_file(HOME / ".config/autostart" / name,
@@ -1380,8 +1393,8 @@ def step10_summary(third_party_ids):
     s.append(f"Dark mode: LXQt theme {'yes' if FACTS.get('dark_theme') else 'no'}, "
              f"Qt apps {'yes' if FACTS.get('dark_palette') else 'no'}, "
              f"GTK apps {'yes' if FACTS.get('dark_gtk') else 'no'}")
-    s.append(f"Window manager xfwm4: {'yes' if FACTS.get('wm') else 'no'}; compositing off, "
-             f"drag-to-edge tiling on: {'yes' if FACTS.get('xfwm4_tuned') else 'no'}")
+    s.append(f"Window manager xfwm4: {'yes' if FACTS.get('wm') else 'no'}; drag-to-edge tiling, "
+             f"Alt+Tab thumbnails, light compositing: {'yes' if FACTS.get('xfwm4_tuned') else 'no'}")
     s += network_lines()
     s.append("Set a DHCP reservation on your router for this server's MAC so its IP never changes.")
 
