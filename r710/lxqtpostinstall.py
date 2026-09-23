@@ -24,8 +24,9 @@ Outline of what it does, in order:
      sleep/suspend/hibernate, and removing printing (cups) and Bluetooth.
   6. Time: America/Chicago, NTP on, 24-hour time for the command line,
      the LXQt session and the panel clock (checked first, changed only if needed).
-  7. LXQt look and speed: dark mode (LXQt, Qt and GTK apps), Openbox as the
-     window manager, no compositor, so the desktop stays responsive over RDP.
+  7. LXQt look and speed: dark mode (LXQt, Qt and GTK apps), and xfwm4 as
+     the window manager with compositing off (responsive over RDP) and
+     drag-to-edge window tiling on.
   8. Remote desktop: xrdp + xorgxrdp, enabled and verified to start at boot,
      each RDP login gets its own LXQt desktop, network buffers tuned to cut
      mouse lag. No screen lock and no idle power actions.
@@ -126,6 +127,18 @@ XRDP_SYSCTL_CONTENT = f"""\
 net.core.wmem_max = 8388608
 net.core.rmem_max = 12582912
 """
+
+# xfwm4 settings (xfconf channel "xfwm4", under /general), checked against
+# xfwm4's own defaults file before writing:
+#   use_compositing off: no shadows/fades/transparency drawn on the CPUs.
+#   tile_on_move on: drag a window to the left/right edge to fill that half,
+#     to the top to maximize.
+#   wrap_windows off: otherwise dragging to an edge flips to the next
+#     workspace instead of tiling.
+#   snap_to_border on: windows snap cleanly against the screen edges.
+XFWM4_DEFAULTS = "/usr/share/xfwm4/defaults"
+XFWM4_SETTINGS = {"use_compositing": "false", "tile_on_move": "true",
+                  "wrap_windows": "false", "snap_to_border": "true"}
 
 # LXQt ships these under /usr/share/lxqt (themes/<name>, palettes/<name>).
 LXQT_SHARE = Path("/usr/share/lxqt")
@@ -937,6 +950,33 @@ def autostart_entries(words):
     return sorted(found)
 
 
+def configure_xfwm4():
+    """Apply XFWM4_SETTINGS with xfconf-query, as your user. Each key is
+    checked against xfwm4's defaults file first (skip if unknown) and only
+    changed if its current value differs."""
+    if DRY_RUN and not os.path.exists(XFWM4_DEFAULTS):
+        say("(dry run: xfwm4 isn't installed yet; a real run sets "
+            + ", ".join(f"{k}={v}" for k, v in XFWM4_SETTINGS.items()) + ")")
+        return True
+    known = {line.split("=", 1)[0].strip() for line in read_lines(XFWM4_DEFAULTS) if "=" in line}
+    if not shutil.which("xfconf-query"):
+        skipped("xfwm4 settings: xfconf-query not found")
+        return False
+    ok = True
+    for key, value in XFWM4_SETTINGS.items():
+        if key not in known:
+            skipped(f"xfwm4 setting {key}: not in {XFWM4_DEFAULTS}")
+            ok = False
+            continue
+        prop = ["xfconf-query", "-c", "xfwm4", "-p", f"/general/{key}"]
+        if output_of(prop) == value:
+            say(f"xfwm4 {key} already {value}")
+        elif run(prop + ["-n", "-t", "bool", "-s", value]).returncode != 0:
+            failed(f"xfwm4 {key}={value}")
+            ok = False
+    return ok
+
+
 def step7_lxqt_desktop():
     step("Step 7: LXQt dark mode and desktop speed")
     lxqt_conf = HOME / ".config/lxqt/lxqt.conf"
@@ -974,13 +1014,14 @@ def step7_lxqt_desktop():
         elif run(["gsettings", "set", *key, "prefer-dark"]).returncode != 0:
             failed("gsettings color-scheme prefer-dark")
 
-    # --- Speed. The R710 has no real GPU, so every visual effect is drawn
-    # by the CPUs and then has to be sent over RDP. Openbox is a plain window
-    # manager with no compositing (no shadows, fades or transparency), which
-    # is what makes the mouse and windows feel immediate.
-    install_packages(["openbox"], "Openbox window manager")
-    if (shutil.which("openbox") or DRY_RUN) and verified("lxqt-session", ["window_manager"], "window manager"):
-        FACTS["wm"] = set_ini(HOME / ".config/lxqt/session.conf", "General", {"window_manager": "openbox"})
+    # --- Window manager: xfwm4 (Xfce's). It's one of LXQt's supported
+    # window managers, stays light with compositing off (the R710 has no real
+    # GPU, so effects are drawn by the CPUs and then sent over RDP), and has
+    # drag-to-edge tiling built in, which Openbox doesn't.
+    install_packages(["xfwm4"], "xfwm4 window manager")
+    if (shutil.which("xfwm4") or DRY_RUN) and verified("lxqt-session", ["window_manager"], "window manager"):
+        FACTS["wm"] = set_ini(HOME / ".config/lxqt/session.conf", "General", {"window_manager": "xfwm4"})
+    FACTS["xfwm4_tuned"] = configure_xfwm4()
     # Standalone compositors that some setups autostart. A same-named file in
     # ~/.config/autostart with Hidden=true switches one off for this user.
     for name in autostart_entries(["picom", "compton", "xcompmgr"]):
@@ -1336,7 +1377,8 @@ def step10_summary(third_party_ids):
     s.append(f"Dark mode: LXQt theme {'yes' if FACTS.get('dark_theme') else 'no'}, "
              f"Qt apps {'yes' if FACTS.get('dark_palette') else 'no'}, "
              f"GTK apps {'yes' if FACTS.get('dark_gtk') else 'no'}")
-    s.append(f"Window manager Openbox (no compositing): {'yes' if FACTS.get('wm') else 'no'}")
+    s.append(f"Window manager xfwm4: {'yes' if FACTS.get('wm') else 'no'}; compositing off, "
+             f"drag-to-edge tiling on: {'yes' if FACTS.get('xfwm4_tuned') else 'no'}")
     s += network_lines()
     s.append("Set a DHCP reservation on your router for this server's MAC so its IP never changes.")
 
