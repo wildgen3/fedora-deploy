@@ -59,8 +59,8 @@ TUNED_PROFILE = "throughput-performance"
 # Packages, grouped so a problem in one group doesn't block the others.
 HELPER_PACKAGES = ["curl", "wget", "unzip", "ethtool", "pciutils", "util-linux"]
 SERVER_PACKAGES = {
-    # 'cockpit*' is a wildcard that dnf itself expands to every Cockpit module.
-    # We pass arguments as a Python list (no shell), so the shell can't expand it.
+    # dnf expands 'cockpit*' to every Cockpit package. Commands are passed as a
+    # list (no shell), so the shell never sees the '*'.
     "remote management": ["cockpit*", "openssh-server", "tmux"],
     "containers and VMs": ["podman", "distrobox", "qemu-kvm", "libvirt", "virt-manager"],
     "monitoring and maintenance": ["btop", "htop", "smartmontools", "tuned", "rsync"],
@@ -70,13 +70,11 @@ SERVER_PACKAGES = {
     "storage tools": ["mdadm", "lvm2", "xfsprogs"],
 }
 
-# fail2ban reads jail.conf first, then overrides from jail.d/*.local.
-# Putting our settings in their own file means jail.conf stays untouched and
-# package updates never conflict with it. Rewriting the whole file each run
-# means reruns can't create duplicate lines.
+# fail2ban reads jail.conf, then overrides from jail.d/*.local. A separate file
+# leaves jail.conf untouched, and rewriting the whole file avoids duplicate lines.
 FAIL2BAN_JAIL = "/etc/fail2ban/jail.d/sshd.local"
 FAIL2BAN_CONTENT = """\
-# Written by postinstall.py. Turns on the sshd jail; jail.conf is not modified.
+# Managed by postinstall.py. Enables the sshd jail.
 [sshd]
 enabled  = true
 # Ban an address for 1 hour after 5 failed logins within 10 minutes.
@@ -85,10 +83,8 @@ findtime = 10m
 bantime  = 1h
 """
 
-# Plasma config keys this script knows are correct, by Plasma major version.
-# If the installed Plasma major version isn't listed (e.g. a future Plasma 7),
-# the matching KDE step is skipped with a warning instead of writing a key
-# that might not mean anything any more.
+# Plasma config keys known to be correct, by Plasma major version. On an
+# unlisted version the matching setting is skipped with a warning.
 KNOWN_PLASMA_KEYS = {
     6: {
         "plasma-localerc/Formats/LC_TIME",
@@ -104,13 +100,12 @@ KNOWN_PLASMA_KEYS = {
     },
 }
 
-# SDDM (the login screen) reads every file in this folder, so autologin gets
-# its own small file instead of editing a shared config.
+# SDDM (the login screen) reads every file in sddm.conf.d; autologin gets its own.
 SDDM_AUTOLOGIN = "/etc/sddm.conf.d/autologin.conf"
 
-RDP_PORT = 3389  # KRDP's default port (already allowed by the firewall zone)
+RDP_PORT = 3389  # KRDP default; the firewall is not changed
 
-# Logs and reports always go to the home directory, wherever the script lives.
+# Logs and reports go to the home directory, not next to the script.
 HOME = Path.home()
 LOG_DIR = HOME / "postinstall-logs"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -192,8 +187,7 @@ def run(cmd, changes_system=True, input_text=None):
         result = subprocess.run(
             cmd,
             input=input_text,
-            # No input needed? Give the command an empty stdin so nothing can
-            # sit waiting for a keypress. (sudo still uses the terminal directly.)
+            # Empty stdin so nothing waits for input (sudo prompts via the terminal).
             stdin=None if input_text is not None else subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -281,8 +275,8 @@ def start_sudo():
 
 def is_dnf5():
     """Fedora 41+ ships dnf5 as `dnf`. Its command syntax differs from dnf4."""
-    dnf_path = shutil.which("dnf") or ""
-    if "dnf5" in os.path.realpath(dnf_path):
+    dnf_path = shutil.which("dnf")
+    if dnf_path and "dnf5" in os.path.realpath(dnf_path):
         return True
     r = run(["dnf", "--version"], changes_system=False)
     return "dnf5" in (r.stdout + r.stderr).lower()
@@ -291,9 +285,8 @@ def is_dnf5():
 def package_available(name):
     """True if dnf can find this package (installed or in an enabled repo).
 
-    `dnf info` matches package names. Some names you'd type are really
-    'provides' of another package (e.g. `vim` is provided by vim-enhanced),
-    so if info finds nothing, ask repoquery who provides it.
+    `dnf info` only matches package names. Some names are provided by another
+    package (`vim` comes from vim-enhanced), so fall back to --whatprovides.
     """
     if run(["sudo", "dnf", "-q", "info", name], changes_system=False).returncode == 0:
         return True
@@ -348,7 +341,7 @@ def repo_states():
 
 def third_party_repo_ids():
     """Repo ids that fedora-third-party manages: every [section] in the .repo
-    files shipped by fedora-workstation-repositories. Detected, not hard-coded."""
+    files shipped by fedora-workstation-repositories."""
     ids = []
     r = run(["rpm", "-ql", "fedora-workstation-repositories"], changes_system=False)
     for path in r.stdout.split():
@@ -465,8 +458,8 @@ def write_root_file(path, content):
 def step5_services():
     step("Step 5: services")
 
-    # SSH + Cockpit first: they're how you'll manage the box remotely.
-    # Debian-style systems call SSH 'ssh.service'; Fedora uses 'sshd.service'.
+    # SSH and Cockpit first (remote management). Fedora's unit is sshd.service;
+    # some distributions call it ssh.service.
     ssh_unit = next((u for u in ("sshd.service", "ssh.service") if unit_exists(u)), "sshd.service")
     enable_now([ssh_unit, "cockpit.socket"])
     FACTS["ssh_unit"] = ssh_unit
@@ -506,7 +499,7 @@ def step5_services():
     write_root_file(FAIL2BAN_JAIL, FAIL2BAN_CONTENT)
     enable_now(["fail2ban.service"])
 
-    # LVM monitoring (snapshots/mirrors); ready for volumes you'll create later.
+    # LVM monitoring (snapshots/mirrors) for volumes created later.
     enable_now(["lvm2-monitor.service"])
 
     say("mdmonitor: not enabled yet. It needs a real array; enable it after you create one "
@@ -573,7 +566,7 @@ def step6_time():
             failed("localectl set-locale")
 
 
-# ---------------------------------------------------------------- KDE (as me)
+# ------------------------------------------------ KDE (per-user, no sudo)
 
 def plasma_major():
     """Installed Plasma major version, from the plasma-workspace package."""
@@ -633,7 +626,7 @@ def kde_setup():
 
 
 def step6_kde_time(major):
-    step("Step 6b: KDE 24-hour time (as you)")
+    step("Step 6b: KDE 24-hour time")
     if major is None or not FACTS.get("locale_ok"):
         return
 
@@ -653,7 +646,7 @@ def step6_kde_time(major):
 
 
 def step7_kde_effects(major):
-    step("Step 7: KDE desktop effects (as you)")
+    step("Step 7: KDE desktop effects")
     if major is None:
         return
     # 0 = animations finish instantly.
@@ -674,8 +667,6 @@ def step7_kde_effects(major):
         say("Baloo file indexing already disabled")
     elif run([baloo, "disable"]).returncode != 0:
         failed("balooctl6 disable")
-
-    NOTES.append("KDE changes (effects, clock, time format) apply after you log out or reboot.")
 
 
 # ------------------------------------------- remote desktop / unattended session
@@ -720,11 +711,11 @@ def keys_verified(major, table_keys, package, names):
 
 
 def find_krdp_unit():
-    """KRDP's systemd *user* unit, found by listing unit files rather than
-    guessing (currently app-org.kde.krdpserver.service)."""
+    """KRDP's systemd user unit, looked up rather than assumed
+    (app-org.kde.krdpserver.service at the time of writing)."""
     r = run(["systemctl", "--user", "list-unit-files", "--no-legend"], changes_system=False)
-    units = [line.split()[0] for line in r.stdout.splitlines()
-             if "krdp" in line.lower() and line.split()[0].endswith(".service")]
+    names = [line.split()[0] for line in r.stdout.splitlines() if line.strip()]
+    units = [u for u in names if "krdp" in u.lower() and u.endswith(".service")]
     # If there's more than one, the server unit is the one we want.
     units.sort(key=lambda u: "krdpserver" not in u.lower())
     return units[0] if units else None
@@ -754,10 +745,10 @@ def sddm_overrides():
 
 def step8_remote_session(major):
     step("Step 8: remote desktop and unattended session")
-    user = pwd.getpwuid(os.getuid()).pw_name  # your login name
+    user = pwd.getpwuid(os.getuid()).pw_name
 
-    # --- KRDP: KDE's built-in RDP server. It shares your logged-in Plasma
-    # session, which is why autologin (below) matters: no session, no desktop.
+    # --- KRDP, KDE's RDP server. It shares the logged-in Plasma session, so it
+    # relies on the autologin below.
     if run(["rpm", "-q", "krdp"], changes_system=False).returncode == 0:
         say("krdp already installed")
     else:
@@ -767,7 +758,7 @@ def step8_remote_session(major):
     unit = find_krdp_unit()
     FACTS["krdp_unit"] = unit
     if unit:
-        # --user = your own systemd instance, so no sudo; it starts with your session.
+        # --user: the per-user systemd instance (no sudo); starts with the session.
         if output_of(["systemctl", "--user", "is-enabled", unit]) == "enabled":
             say(f"{unit}: already enabled")
         elif run(["systemctl", "--user", "enable", unit]).returncode != 0:
@@ -786,15 +777,15 @@ def step8_remote_session(major):
         skipped(f"SDDM autologin: no Plasma session in /usr/share/wayland-sessions (found: {', '.join(sessions) or 'none'})")
         FACTS["autologin"] = "no (Plasma Wayland session not found)"
     else:
-        write_root_file(SDDM_AUTOLOGIN, f"# Written by postinstall.py: log {user} straight into Plasma at boot.\n"
+        write_root_file(SDDM_AUTOLOGIN, f"# Managed by postinstall.py.\n"
                                         f"[Autologin]\nUser={user}\nSession={session}\n")
         FACTS["autologin"] = f"yes ({user}, session {session})"
         overrides = sddm_overrides()
         if overrides:
             warn(f"{', '.join(overrides)} also set [Autologin] and are read after {SDDM_AUTOLOGIN}")
             FACTS["autologin"] += f", but overridden by {', '.join(overrides)}"
-        NOTES.append("Autologin means KWallet isn't unlocked by a password at login. If KRDP asks for the "
-                     "wallet or RDP logins fail after a reboot, give the wallet an empty password in KWalletManager.")
+        NOTES.append("Autologin doesn't unlock KWallet. If KRDP prompts for the wallet or RDP logins fail "
+                     "after a reboot, set an empty wallet password in KWalletManager.")
 
     if major is None:
         return  # kwriteconfig6 or Plasma version missing; already reported
@@ -820,8 +811,6 @@ def step8_remote_session(major):
             kwrite("powerdevilrc", ["AC", "SuspendAndShutdown"], "AutoSuspendAction", 0),
         ])
 
-    NOTES.append("Session changes (autologin, screen lock, power, KRDP autostart) apply after a reboot or logout.")
-
 
 # ------------------------------------------------------ drive report (read-only)
 
@@ -835,7 +824,7 @@ def human_size(num_bytes):
 def parent_disk(dev):
     """Walk up from a partition / LVM / LUKS / md device to its whole disk,
     e.g. /dev/sda3 -> 'sda'. Returns None if it can't be worked out."""
-    for _ in range(10):  # a few levels is plenty; stops runaway loops
+    for _ in range(10):  # depth limit guards against loops
         dev_type = output_of(["lsblk", "-ndo", "TYPE", dev])
         if dev_type == "disk":
             return os.path.basename(os.path.realpath(dev))
@@ -869,7 +858,6 @@ def smart_report():
         if len(parts) >= 3 and parts[1] == "-d" and parts[2].startswith("megaraid"):
             entries.append((parts[0], parts[2]))
     if not entries:
-        FACTS["smart_note"] = "no megaraid drives listed by smartctl --scan"
         return ["  - smartctl --scan listed no megaraid drives (health check not available)"]
 
     # SATA and SAS drives label the same facts differently.
@@ -1056,7 +1044,7 @@ def step10_summary(third_party_ids):
     s.append(f"tuned profile: {output_of(['tuned-adm', 'active']).replace('Current active profile: ', '') or 'unknown'}")
 
     ip = primary_ip()
-    s.append(f"Hostname: {socket.gethostname()} (set it yourself in KDE's System Settings)")
+    s.append(f"Hostname: {socket.gethostname()}")
     s.append(f"Cockpit: https://{ip}:9090")
 
     unit = FACTS.get("krdp_unit")
@@ -1064,8 +1052,7 @@ def step10_summary(third_party_ids):
     s.append(f"KRDP installed: {'yes' if FACTS.get('krdp_installed') else 'no'}; "
              f"autostart enabled: {'yes' if autostart else 'no'}{f' ({unit})' if unit else ''}")
     s.append(f"Remote desktop: in Remmina, RDP to {ip}:{RDP_PORT}")
-    s.append("RDP login: add the RDP username/password once in System Settings > Remote Desktop "
-             "(this script doesn't set it)")
+    s.append("RDP login: set the RDP username/password once in System Settings > Remote Desktop")
     s.append(f"Autologin: {FACTS.get('autologin', 'no')}")
     s.append(f"Screen lock off: {'yes' if FACTS.get('screenlock_off') else 'no'}")
     s.append(f"Power settings (no dim, no screen off, no suspend on AC): {'yes' if FACTS.get('power_off') else 'no'}")
@@ -1090,7 +1077,8 @@ def step10_summary(third_party_ids):
         s.append("Failed: nothing")
     for note in NOTES:
         s.append(f"Note: {note}")
-    s.append("Reboot to apply the update, the kernel, and the KDE/locale changes.")
+    s.append("Reboot (or at least log out) to apply the update, kernel, KDE settings, "
+             "autologin, screen lock, power settings and KRDP autostart.")
     s.append(f"Full log: {LOG_FILE}")
 
     say("")
