@@ -156,6 +156,7 @@ UNNEEDED = {"cups": "printing", "bluez": "Bluetooth"}
 
 # Automatic updates: download and install all available updates (system
 # and security, "default"), daily, without asking.
+AUTO_UPDATES_CONF = "/etc/dnf/automatic.conf"
 AUTO_UPDATES = {"download_updates": "yes", "apply_updates": "yes", "upgrade_type": "default"}
 
 # Logs and reports go to the home directory, not next to the script.
@@ -454,15 +455,14 @@ def step1_update(dnf5):
     # its own; kernel updates take effect at your next reboot.
     package = "dnf5-plugin-automatic" if dnf5 else "dnf-automatic"
     install_packages([package], "automatic updates")
+    # Both dnf versions read /etc/dnf/automatic.conf (dnf5 layers it over its
+    # defaults in /usr/share/dnf5/dnf5-plugins/). dnf5 doesn't create the /etc
+    # file, so start it as a copy of those defaults.
     files = run(["rpm", "-ql", package], changes_system=False).stdout.split()
-    confs = [f for f in files if f.endswith("/automatic.conf")]
-    etc_conf = next((f for f in confs if f.startswith("/etc/")),
-                    "/etc/dnf/dnf5-plugins/automatic.conf" if dnf5 else "/etc/dnf/automatic.conf")
-    # dnf5 keeps its defaults under /usr/share; start the /etc copy from them.
-    default = next((f for f in confs if f.startswith("/usr/")), None)
-    if not os.path.exists(etc_conf) and default:
-        run(["sudo", "install", "-D", "-m", "644", default, etc_conf])
-    FACTS["auto_updates"] = set_root_ini(etc_conf, "commands", AUTO_UPDATES)
+    default = next((f for f in files if f.startswith("/usr/") and f.endswith("/automatic.conf")), None)
+    if not os.path.exists(AUTO_UPDATES_CONF) and default:
+        run(["sudo", "install", "-D", "-m", "644", default, AUTO_UPDATES_CONF])
+    FACTS["auto_updates"] = set_root_ini(AUTO_UPDATES_CONF, "commands", AUTO_UPDATES)
     timer = next((t for t in ("dnf5-automatic.timer", "dnf-automatic.timer") if unit_exists(t)),
                  "dnf5-automatic.timer" if dnf5 else "dnf-automatic.timer")
     enable_now([timer])
@@ -767,7 +767,7 @@ def package_has_keys(package, names):
         if not missing:
             break
         # Only libraries and programs can contain them.
-        if not (".so" in path or "/bin/" in path or "/libexec/" in path):
+        if not (".so" in path or "bin/" in path or "/libexec/" in path):
             continue
         p = Path(path)
         if p.is_symlink() or not p.is_file():
@@ -784,6 +784,9 @@ def package_has_keys(package, names):
 
 def verified(package, names, what):
     """Only write settings the installed package actually uses."""
+    if DRY_RUN and run(["rpm", "-q", package], changes_system=False).returncode != 0:
+        say(f"(dry run: {package} isn't installed yet; a real run checks {what} after installing)")
+        return True
     missing = package_has_keys(package, names)
     if missing:
         skipped(f"{what}: {', '.join(sorted(missing))} not found in the installed {package} package")

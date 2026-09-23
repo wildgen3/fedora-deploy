@@ -836,7 +836,7 @@ def package_has_keys(package, names):
         if not missing:
             break
         # Only libraries, programs and config definitions can contain them.
-        if not (".so" in path or "/bin/" in path or "/libexec/" in path or path.endswith((".kcfg", ".xml"))):
+        if not (".so" in path or "bin/" in path or "/libexec/" in path or path.endswith((".kcfg", ".xml"))):
             continue
         p = Path(path)
         if p.is_symlink() or not p.is_file():
