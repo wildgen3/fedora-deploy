@@ -10,14 +10,16 @@ Outline of what it does, in order:
   0. Safety checks: not root, Fedora (read from /etc/os-release), user is in
      wheel, one `sudo -v` password prompt, then a background thread keeps
      sudo alive until the end.
-  1. System update: `dnf upgrade --refresh`. If this fails, the script stops.
+  1. System update: `dnf upgrade --refresh` (the script stops if it fails),
+     then automatic daily installs of all system and security updates.
   2. Third-party repos: `fedora-third-party enable`, then enable any of its
      DNF repos that are still disabled, then `dnf makecache`.
   3. Helper tools (curl, wget, unzip, ...).
   4. Server packages (Cockpit, SSH, containers/VMs, monitoring, storage tools).
      Every package is checked with `dnf info` first; missing ones are skipped.
   5. Services: sshd + Cockpit, libvirt, tuned, fail2ban (sshd jail), LVM
-     monitor, and masking sleep/suspend/hibernate.
+     monitor, hardware health, smartd for the PERC's drives, masking
+     sleep/suspend/hibernate, and removing printing (cups) and Bluetooth.
   6. Time: America/Chicago, NTP on, 24-hour time for the command line,
      the LXQt session and the panel clock (checked first, changed only if needed).
   7. LXQt look and speed: dark mode (LXQt, Qt and GTK apps), Openbox as the
@@ -121,6 +123,21 @@ net.core.rmem_max = 12582912
 
 # LXQt ships these under /usr/share/lxqt (themes/<name>, palettes/<name>).
 LXQT_SHARE = Path("/usr/share/lxqt")
+
+# smartd watches drive health in the background. Behind the PERC, drives
+# can only be reached through smartctl's megaraid pass-through, so the
+# config lists each one found by `smartctl --scan` explicitly:
+#   -a: monitor everything; -s: short self-test daily at 02:00,
+#   long self-test Saturdays at 03:00. Problems go to the system journal.
+SMARTD_CONF = "/etc/smartmontools/smartd.conf"
+SMARTD_OPTIONS = "-a -s (S/../.././02|L/../../6/03)"
+
+# Services a headless server doesn't need; their packages are removed.
+UNNEEDED = {"cups": "printing", "bluez": "Bluetooth"}
+
+# Automatic updates: download and install all available updates (system
+# and security, "default"), daily, without asking.
+AUTO_UPDATES = {"download_updates": "yes", "apply_updates": "yes", "upgrade_type": "default"}
 
 # Logs and reports go to the home directory, not next to the script.
 HOME = Path.home()
@@ -407,11 +424,30 @@ def unit_state(unit):
 
 # ---------------------------------------------------------------- the steps
 
-def step1_update():
-    step("Step 1: system update")
+def step1_update(dnf5):
+    step("Step 1: system update and automatic updates")
     say("This can take a while on a fresh install.")
     if run(["sudo", "dnf", "upgrade", "--refresh", "-y"]).returncode != 0:
         fatal("`dnf upgrade` failed. Fix networking/repos and rerun.")
+
+    # From now on, a daily timer downloads and installs every update
+    # (system and security) with no approval needed. It never reboots on
+    # its own; kernel updates take effect at your next reboot.
+    package = "dnf5-plugin-automatic" if dnf5 else "dnf-automatic"
+    install_packages([package], "automatic updates")
+    files = run(["rpm", "-ql", package], changes_system=False).stdout.split()
+    confs = [f for f in files if f.endswith("/automatic.conf")]
+    etc_conf = next((f for f in confs if f.startswith("/etc/")),
+                    "/etc/dnf/dnf5-plugins/automatic.conf" if dnf5 else "/etc/dnf/automatic.conf")
+    # dnf5 keeps its defaults under /usr/share; start the /etc copy from them.
+    default = next((f for f in confs if f.startswith("/usr/")), None)
+    if not os.path.exists(etc_conf) and default:
+        run(["sudo", "install", "-D", "-m", "644", default, etc_conf])
+    FACTS["auto_updates"] = set_root_ini(etc_conf, "commands", AUTO_UPDATES)
+    timer = next((t for t in ("dnf5-automatic.timer", "dnf-automatic.timer") if unit_exists(t)),
+                 "dnf5-automatic.timer" if dnf5 else "dnf-automatic.timer")
+    enable_now([timer])
+    FACTS["auto_updates_timer"] = timer
 
 
 def step2_third_party_repos(dnf5):
@@ -479,6 +515,50 @@ def write_root_file(path, content, mode=None):
     return True
 
 
+def megaraid_drives():
+    """(device, type) for each physical drive smartctl finds behind the PERC.
+    Lines look like: /dev/bus/0 -d megaraid,0 # /dev/bus/0 [megaraid_disk_00], SCSI device"""
+    scan = run(["sudo", "smartctl", "--scan"], changes_system=False)
+    drives = []
+    for line in scan.stdout.splitlines():
+        parts = line.split("#")[0].split()
+        if len(parts) >= 3 and parts[1] == "-d" and parts[2].startswith("megaraid"):
+            drives.append((parts[0], parts[2]))
+    return drives
+
+
+def setup_smartd():
+    """Point smartd at the PERC's physical drives and start it at boot."""
+    if not (shutil.which("smartctl") or os.path.exists("/usr/sbin/smartctl")):
+        if DRY_RUN:
+            say("(dry run: smartmontools isn't installed yet; a real run configures smartd here)")
+        else:
+            failed("smartd: smartctl not found")
+        return
+    drives = megaraid_drives()
+    if drives:
+        conf = f"# Managed by {SCRIPT}. PERC physical drives, via megaraid pass-through.\n"
+        conf += "".join(f"{dev} -d {dtype} {SMARTD_OPTIONS}\n" for dev, dtype in drives)
+        changed = not (Path(SMARTD_CONF).exists() and Path(SMARTD_CONF).read_text() == conf)
+        if write_root_file(SMARTD_CONF, conf) and changed:
+            run(["sudo", "systemctl", "try-restart", "smartd.service"])
+        FACTS["smartd_drives"] = len(drives)
+    else:
+        say("smartd: no megaraid drives found; keeping the default config (scan all disks)")
+    enable_now(["smartd.service"])
+
+
+def remove_unneeded():
+    """Uninstall printing and Bluetooth; a server has no printer or radios."""
+    for package, what in UNNEEDED.items():
+        if run(["rpm", "-q", package], changes_system=False).returncode != 0:
+            say(f"{package} ({what}) not installed")
+        elif run(["sudo", "dnf", "remove", "-y", package]).returncode != 0:
+            failed(f"remove {package}")
+        else:
+            FACTS.setdefault("removed", []).append(package)
+
+
 def step5_services():
     step("Step 5: services")
 
@@ -528,6 +608,12 @@ def step5_services():
 
     # Hardware health: error logging, performance history, interrupt spreading.
     enable_now(["rasdaemon.service", "sysstat.service", "irqbalance.service"])
+
+    # Drive health monitoring for the PERC's physical drives.
+    setup_smartd()
+
+    # Printing and Bluetooth: not needed on this server.
+    remove_unneeded()
 
     say("mdmonitor: not enabled yet. It needs a real array; enable it after you create one "
         "(sudo systemctl enable --now mdmonitor).")
@@ -1142,6 +1228,9 @@ def step10_summary(third_party_ids):
     step("Step 10: summary")
     s = []
     s.append(f"Fedora: {FACTS.get('release')}, kernel {FACTS.get('kernel')}")
+    timer = FACTS.get("auto_updates_timer", "dnf5-automatic.timer")
+    s.append(f"Automatic updates (all, installed daily, no auto-reboot): "
+             f"{'yes' if FACTS.get('auto_updates') else 'no'}; {timer}: {unit_state(timer)}")
 
     states = repo_states()
     enabled = [r for r in third_party_ids if states.get(r) == "enabled"]
@@ -1157,8 +1246,10 @@ def step10_summary(third_party_ids):
 
     for unit in (FACTS.get("ssh_unit", "sshd.service"), "cockpit.socket", "tuned.service",
                  "fail2ban.service", *FACTS.get("libvirt_units", []), "lvm2-monitor.service",
-                 "rasdaemon.service", "sysstat.service", "irqbalance.service"):
+                 "rasdaemon.service", "sysstat.service", "irqbalance.service", "smartd.service"):
         s.append(f"{unit}: {unit_state(unit)}")
+    s.append(f"smartd watching PERC drives: {FACTS.get('smartd_drives', 0)}")
+    s.append(f"Removed: {', '.join(FACTS.get('removed', [])) or 'nothing (cups/bluez already absent)'}")
     s.append(f"tuned profile: {output_of(['tuned-adm', 'active']).replace('Current active profile: ', '') or 'unknown'}")
 
     ip = primary_ip()
@@ -1253,7 +1344,7 @@ def main():
         dnf5 = is_dnf5()
         say(f"Package manager: {'dnf5' if dnf5 else 'dnf4'}")
 
-        step1_update()
+        step1_update(dnf5)
         step2_third_party_repos(dnf5)
         step3_helpers()
         step4_server_packages()
