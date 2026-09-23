@@ -9,7 +9,7 @@ Run it as your normal (wheel/administrator) user, never as root:
 Outline of what it does, in order:
   0. Safety checks: not root, Fedora (read from /etc/os-release), user is in
      wheel, one `sudo -v` password prompt, then a background thread keeps
-     sudo alive until the end. Then it asks for a hostname (Enter keeps it).
+     sudo alive until the end.
   1. System update: `dnf upgrade --refresh`. If this fails, the script stops.
   2. Third-party repos: `fedora-third-party enable`, then enable any of its
      DNF repos that are still disabled (KDE quirk), then `dnf makecache`.
@@ -275,36 +275,6 @@ def start_sudo():
     stop = threading.Event()
     threading.Thread(target=keep_sudo_alive, args=(stop,), daemon=True).start()
     return stop
-
-
-def valid_hostname(name):
-    """Letters, digits and '-' per dot-separated part (1-63 chars, no '-' at
-    either end), 253 chars max overall. The standard rules for hostnames."""
-    label = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-    return len(name) <= 253 and all(label.match(part) for part in name.split("."))
-
-
-def ask_hostname():
-    """Ask once at startup so the rest of the run needs no input."""
-    current = socket.gethostname()
-    FACTS["hostname"] = current
-    say(f"Current hostname: {current}")
-    while True:
-        try:
-            name = input("Hostname for this server (Enter to keep current): ").strip()
-        except EOFError:
-            name = ""
-        log(f"Hostname answer: {name!r}")
-        if not name or name == current:
-            say(f"Keeping hostname {current}")
-            return
-        if valid_hostname(name):
-            break
-        say("Not a valid hostname (letters, digits and '-', like r710 or r710.home). Try again.")
-    if run(["sudo", "hostnamectl", "set-hostname", name]).returncode == 0:
-        FACTS["hostname"] = name + (" (after this run)" if DRY_RUN else "")
-    else:
-        failed(f"hostnamectl set-hostname {name}")
 
 
 # ---------------------------------------------------------------- dnf helpers
@@ -1086,7 +1056,7 @@ def step10_summary(third_party_ids):
     s.append(f"tuned profile: {output_of(['tuned-adm', 'active']).replace('Current active profile: ', '') or 'unknown'}")
 
     ip = primary_ip()
-    s.append(f"Hostname: {FACTS.get('hostname', socket.gethostname())}")
+    s.append(f"Hostname: {socket.gethostname()} (set it yourself in KDE's System Settings)")
     s.append(f"Cockpit: https://{ip}:9090")
 
     unit = FACTS.get("krdp_unit")
@@ -1169,7 +1139,6 @@ def main():
     check_wheel()
     stop_sudo = start_sudo()
     try:
-        ask_hostname()
         dnf5 = is_dnf5()
         say(f"Package manager: {'dnf5' if dnf5 else 'dnf4'}")
 
