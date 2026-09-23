@@ -9,7 +9,7 @@ Run it as your normal (wheel/administrator) user, never as root:
 Outline of what it does, in order:
   0. Safety checks: not root, Fedora (read from /etc/os-release), user is in
      wheel, one `sudo -v` password prompt, then a background thread keeps
-     sudo alive until the end.
+     sudo alive until the end. Then it asks for a hostname (Enter keeps it).
   1. System update: `dnf upgrade --refresh`. If this fails, the script stops.
   2. Third-party repos: `fedora-third-party enable`, then enable any of its
      DNF repos that are still disabled (KDE quirk), then `dnf makecache`.
@@ -20,8 +20,11 @@ Outline of what it does, in order:
      monitor, and masking sleep/suspend/hibernate.
   6. Time: America/Chicago, NTP on, 24-hour time for the command line and KDE.
   7. KDE: no animations, no blur/contrast, no Baloo file indexing.
-  8. Read-only drive report (nothing is created, wiped or formatted).
-  9. Summary, then "Reboot now? [y/N]".
+  8. Remote desktop and unattended session: KRDP (KDE's RDP server) starts
+     with your session, SDDM logs you in automatically, no screen lock, and
+     no screen dimming/turn-off/suspend on AC power.
+  9. Read-only drive report (nothing is created, wiped or formatted).
+ 10. Summary (including network interfaces), then "Reboot now? [y/N]".
 
 Everything is logged to ~/postinstall-logs/. Running it twice is harmless.
 Only the Python standard library is used.
@@ -32,9 +35,11 @@ import datetime
 import grp
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -91,8 +96,19 @@ KNOWN_PLASMA_KEYS = {
         "kdeglobals/KDE/AnimationDurationFactor",
         "kwinrc/Plugins/blurEnabled",
         "kwinrc/Plugins/contrastEnabled",
+        "kscreenlockerrc/Daemon/Autolock",
+        "kscreenlockerrc/Daemon/LockOnResume",
+        "powerdevilrc/AC/Display/DimDisplayWhenIdle",
+        "powerdevilrc/AC/Display/TurnOffDisplayWhenIdle",
+        "powerdevilrc/AC/SuspendAndShutdown/AutoSuspendAction",
     },
 }
+
+# SDDM (the login screen) reads every file in this folder, so autologin gets
+# its own small file instead of editing a shared config.
+SDDM_AUTOLOGIN = "/etc/sddm.conf.d/autologin.conf"
+
+RDP_PORT = 3389  # KRDP's default port (already allowed by the firewall zone)
 
 # Logs and reports always go to the home directory, wherever the script lives.
 HOME = Path.home()
@@ -259,6 +275,36 @@ def start_sudo():
     stop = threading.Event()
     threading.Thread(target=keep_sudo_alive, args=(stop,), daemon=True).start()
     return stop
+
+
+def valid_hostname(name):
+    """Letters, digits and '-' per dot-separated part (1-63 chars, no '-' at
+    either end), 253 chars max overall. The standard rules for hostnames."""
+    label = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+    return len(name) <= 253 and all(label.match(part) for part in name.split("."))
+
+
+def ask_hostname():
+    """Ask once at startup so the rest of the run needs no input."""
+    current = socket.gethostname()
+    FACTS["hostname"] = current
+    say(f"Current hostname: {current}")
+    while True:
+        try:
+            name = input("Hostname for this server (Enter to keep current): ").strip()
+        except EOFError:
+            name = ""
+        log(f"Hostname answer: {name!r}")
+        if not name or name == current:
+            say(f"Keeping hostname {current}")
+            return
+        if valid_hostname(name):
+            break
+        say("Not a valid hostname (letters, digits and '-', like r710 or r710.home). Try again.")
+    if run(["sudo", "hostnamectl", "set-hostname", name]).returncode == 0:
+        FACTS["hostname"] = name + (" (after this run)" if DRY_RUN else "")
+    else:
+        failed(f"hostnamectl set-hostname {name}")
 
 
 # ---------------------------------------------------------------- dnf helpers
@@ -662,6 +708,151 @@ def step7_kde_effects(major):
     NOTES.append("KDE changes (effects, clock, time format) apply after you log out or reboot.")
 
 
+# ------------------------------------------- remote desktop / unattended session
+
+def package_has_keys(package, names):
+    """Check an installed package really uses these config names by looking
+    for them inside its files. KDE compiles its config definitions into its
+    libraries, where Qt stores strings as UTF-16, so look for both encodings.
+    Returns the names that were NOT found (all of them if not installed)."""
+    missing = set(names)
+    r = run(["rpm", "-ql", package], changes_system=False)
+    if r.returncode != 0:
+        return missing
+    for path in r.stdout.split():
+        if not missing:
+            break
+        # Only libraries, programs and config definitions can contain them.
+        if not (".so" in path or "/bin/" in path or "/libexec/" in path or path.endswith((".kcfg", ".xml"))):
+            continue
+        p = Path(path)
+        if p.is_symlink() or not p.is_file():
+            continue
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        for name in list(missing):
+            if name.encode() in data or name.encode("utf-16-le") in data:
+                missing.discard(name)
+    return missing
+
+
+def keys_verified(major, table_keys, package, names):
+    """Both checks: known for this Plasma version, and present in the package."""
+    if not all(key_known(major, k) for k in table_keys):
+        return False
+    missing = package_has_keys(package, names)
+    if missing:
+        skipped(f"{package}: config names {', '.join(sorted(missing))} not found in the installed package")
+        return False
+    return True
+
+
+def find_krdp_unit():
+    """KRDP's systemd *user* unit, found by listing unit files rather than
+    guessing (currently app-org.kde.krdpserver.service)."""
+    r = run(["systemctl", "--user", "list-unit-files", "--no-legend"], changes_system=False)
+    units = [line.split()[0] for line in r.stdout.splitlines()
+             if "krdp" in line.lower() and line.split()[0].endswith(".service")]
+    # If there's more than one, the server unit is the one we want.
+    units.sort(key=lambda u: "krdpserver" not in u.lower())
+    return units[0] if units else None
+
+
+def sddm_overrides():
+    """Other SDDM config files that also set [Autologin] User/Session and are
+    read after ours (files are read in name order, /etc/sddm.conf last),
+    which would quietly override it."""
+    later = sorted(str(p) for p in Path("/etc/sddm.conf.d").glob("*.conf") if p.name > "autologin.conf")
+    found = []
+    for path in later + ["/etc/sddm.conf"]:
+        try:
+            lines = Path(path).read_text().splitlines()
+        except OSError:
+            continue
+        section = ""
+        for line in lines:
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+            elif section == "[Autologin]" and line.startswith(("User=", "Session=")):
+                found.append(path)
+                break
+    return found
+
+
+def step8_remote_session(major):
+    step("Step 8: remote desktop and unattended session")
+    user = pwd.getpwuid(os.getuid()).pw_name  # your login name
+
+    # --- KRDP: KDE's built-in RDP server. It shares your logged-in Plasma
+    # session, which is why autologin (below) matters: no session, no desktop.
+    if run(["rpm", "-q", "krdp"], changes_system=False).returncode == 0:
+        say("krdp already installed")
+    else:
+        install_packages(["krdp"], "KRDP remote desktop")
+    FACTS["krdp_installed"] = DRY_RUN or run(["rpm", "-q", "krdp"], changes_system=False).returncode == 0
+
+    unit = find_krdp_unit()
+    FACTS["krdp_unit"] = unit
+    if unit:
+        # --user = your own systemd instance, so no sudo; it starts with your session.
+        if output_of(["systemctl", "--user", "is-enabled", unit]) == "enabled":
+            say(f"{unit}: already enabled")
+        elif run(["systemctl", "--user", "enable", unit]).returncode != 0:
+            failed(f"systemctl --user enable {unit}")
+    elif DRY_RUN:
+        say("(dry run: KRDP isn't installed yet, so its user unit can't be looked up; "
+            "a real run would enable it with systemctl --user enable)")
+    else:
+        skipped("KRDP autostart: no krdp unit in `systemctl --user list-unit-files`")
+
+    # --- SDDM autologin into the Plasma Wayland session. The session name is
+    # the .desktop file name in /usr/share/wayland-sessions/ without '.desktop'.
+    sessions = sorted(p.stem for p in Path("/usr/share/wayland-sessions").glob("*.desktop"))
+    session = "plasma" if "plasma" in sessions else next((s for s in sessions if "plasma" in s), None)
+    if not session:
+        skipped(f"SDDM autologin: no Plasma session in /usr/share/wayland-sessions (found: {', '.join(sessions) or 'none'})")
+        FACTS["autologin"] = "no (Plasma Wayland session not found)"
+    else:
+        write_root_file(SDDM_AUTOLOGIN, f"# Written by postinstall.py: log {user} straight into Plasma at boot.\n"
+                                        f"[Autologin]\nUser={user}\nSession={session}\n")
+        FACTS["autologin"] = f"yes ({user}, session {session})"
+        overrides = sddm_overrides()
+        if overrides:
+            warn(f"{', '.join(overrides)} also set [Autologin] and are read after {SDDM_AUTOLOGIN}")
+            FACTS["autologin"] += f", but overridden by {', '.join(overrides)}"
+        NOTES.append("Autologin means KWallet isn't unlocked by a password at login. If KRDP asks for the "
+                     "wallet or RDP logins fail after a reboot, give the wallet an empty password in KWalletManager.")
+
+    if major is None:
+        return  # kwriteconfig6 or Plasma version missing; already reported
+
+    # --- Screen lock off: never lock after idle, and don't lock on wake.
+    if keys_verified(major, ["kscreenlockerrc/Daemon/Autolock", "kscreenlockerrc/Daemon/LockOnResume"],
+                     "kscreenlocker", ["Autolock", "LockOnResume"]):
+        FACTS["screenlock_off"] = all([
+            kwrite("kscreenlockerrc", ["Daemon"], "Autolock", "false"),
+            kwrite("kscreenlockerrc", ["Daemon"], "LockOnResume", "false"),
+        ])
+
+    # --- Power management on AC (Plasma 6 layout: [AC][Display] and
+    # [AC][SuspendAndShutdown] in powerdevilrc). AutoSuspendAction 0 = do nothing.
+    if keys_verified(major, ["powerdevilrc/AC/Display/DimDisplayWhenIdle",
+                             "powerdevilrc/AC/Display/TurnOffDisplayWhenIdle",
+                             "powerdevilrc/AC/SuspendAndShutdown/AutoSuspendAction"],
+                     "powerdevil", ["DimDisplayWhenIdle", "TurnOffDisplayWhenIdle",
+                                    "SuspendAndShutdown", "AutoSuspendAction"]):
+        FACTS["power_off"] = all([
+            kwrite("powerdevilrc", ["AC", "Display"], "DimDisplayWhenIdle", "false"),
+            kwrite("powerdevilrc", ["AC", "Display"], "TurnOffDisplayWhenIdle", "false"),
+            kwrite("powerdevilrc", ["AC", "SuspendAndShutdown"], "AutoSuspendAction", 0),
+        ])
+
+    NOTES.append("Session changes (autologin, screen lock, power, KRDP autostart) apply after a reboot or logout.")
+
+
 # ------------------------------------------------------ drive report (read-only)
 
 def human_size(num_bytes):
@@ -739,8 +930,8 @@ def smart_report():
     return lines
 
 
-def step8_drive_report():
-    step("Step 8: drive report (read-only)")
+def step9_drive_report():
+    step("Step 9: drive report (read-only)")
     rep = [f"Drive report - {datetime.datetime.now():%Y-%m-%d %H:%M} - {FACTS.get('release', '')}", ""]
 
     # --- where is the OS installed?
@@ -851,8 +1042,29 @@ def primary_ip():
     return addrs[0] if addrs else "<this machine's IP>"
 
 
-def step9_summary(third_party_ids):
-    step("Step 9: summary")
+def network_lines():
+    """One line per physical network port: IPv4 address(es), MAC, link state.
+    `ip -j` is the JSON form of `ip -4 addr` / `ip link`. Virtual interfaces
+    (libvirt/podman bridges) are left out: ports with no /sys/.../device."""
+    try:
+        links = json.loads(output_of(["ip", "-j", "link"]) or "[]")
+        addrs = json.loads(output_of(["ip", "-j", "-4", "addr"]) or "[]")
+    except ValueError:
+        return ["Network: couldn't read interfaces (see log)"]
+    ipv4 = {a.get("ifname"): [f"{i['local']}/{i['prefixlen']}" for i in a.get("addr_info", [])
+                               if i.get("family") == "inet"] for a in addrs}
+    lines = []
+    for link in links:
+        name = link.get("ifname", "?")
+        if name == "lo" or not os.path.exists(f"/sys/class/net/{name}/device"):
+            continue
+        lines.append(f"Network {name}: IPv4 {', '.join(ipv4.get(name) or []) or 'none'}, "
+                     f"MAC {link.get('address', '?')}, link {link.get('operstate', '?').lower()}")
+    return lines or ["Network: no physical interfaces found"]
+
+
+def step10_summary(third_party_ids):
+    step("Step 10: summary")
     s = []
     s.append(f"Fedora: {FACTS.get('release')}, kernel {FACTS.get('kernel')}")
 
@@ -873,7 +1085,22 @@ def step9_summary(third_party_ids):
         s.append(f"{unit}: {unit_state(unit)}")
     s.append(f"tuned profile: {output_of(['tuned-adm', 'active']).replace('Current active profile: ', '') or 'unknown'}")
 
-    s.append(f"Cockpit: https://{primary_ip()}:9090")
+    ip = primary_ip()
+    s.append(f"Hostname: {FACTS.get('hostname', socket.gethostname())}")
+    s.append(f"Cockpit: https://{ip}:9090")
+
+    unit = FACTS.get("krdp_unit")
+    autostart = bool(unit) and output_of(["systemctl", "--user", "is-enabled", unit]) == "enabled"
+    s.append(f"KRDP installed: {'yes' if FACTS.get('krdp_installed') else 'no'}; "
+             f"autostart enabled: {'yes' if autostart else 'no'}{f' ({unit})' if unit else ''}")
+    s.append(f"Remote desktop: in Remmina, RDP to {ip}:{RDP_PORT}")
+    s.append("RDP login: add the RDP username/password once in System Settings > Remote Desktop "
+             "(this script doesn't set it)")
+    s.append(f"Autologin: {FACTS.get('autologin', 'no')}")
+    s.append(f"Screen lock off: {'yes' if FACTS.get('screenlock_off') else 'no'}")
+    s.append(f"Power settings (no dim, no screen off, no suspend on AC): {'yes' if FACTS.get('power_off') else 'no'}")
+    s += network_lines()
+    s.append("Set a DHCP reservation on your router for this server's MAC so its IP never changes.")
 
     tz = output_of(["timedatectl", "show", "-p", "Timezone", "--value"]) or "unknown"
     s.append(f"Time zone: {tz}")
@@ -942,6 +1169,7 @@ def main():
     check_wheel()
     stop_sudo = start_sudo()
     try:
+        ask_hostname()
         dnf5 = is_dnf5()
         say(f"Package manager: {'dnf5' if dnf5 else 'dnf4'}")
 
@@ -954,8 +1182,9 @@ def main():
         major = kde_setup()
         step6_kde_time(major)
         step7_kde_effects(major)
-        step8_drive_report()
-        step9_summary(third_party_repo_ids())
+        step8_remote_session(major)
+        step9_drive_report()
+        step10_summary(third_party_repo_ids())
         ask_reboot()
     except KeyboardInterrupt:
         fatal("interrupted.")
