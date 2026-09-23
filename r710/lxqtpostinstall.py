@@ -14,7 +14,9 @@ Outline of what it does, in order:
      then automatic daily installs of all system and security updates.
   2. Third-party repos: `fedora-third-party enable`, then enable any of its
      DNF repos that are still disabled, then `dnf makecache`.
-  3. Helper tools (curl, wget, unzip, ...).
+  3. Helper tools (curl, wget, unzip, ...), then a hardware check: install
+     any firmware the kernel asked for and couldn't find (network cards in
+     the PCIe risers, for example), and list PCI devices with no driver.
   4. Server packages (Cockpit, SSH, containers/VMs, monitoring, storage tools).
      Every package is checked with `dnf info` first; missing ones are skipped.
   5. Services: sshd + Cockpit, libvirt, tuned, fail2ban (sshd jail), LVM
@@ -78,6 +80,10 @@ SERVER_PACKAGES = {
     # spreads hardware interrupts across both CPUs; numactl shows and controls
     # which CPU socket's memory a program uses.
     "hardware health": ["rasdaemon", "lm_sensors", "sysstat", "irqbalance", "numactl"],
+    # BorgBackup: deduplicated, compressed, encrypted backups; borgmatic runs
+    # it from one config file on a schedule. Installed only: the repository
+    # goes on storage that doesn't exist yet.
+    "backups": ["borgbackup", "borgmatic"],
 }
 
 # fail2ban reads jail.conf, then overrides from jail.d/*.local. A separate file
@@ -484,8 +490,63 @@ def step2_third_party_repos(dnf5):
 
 
 def step3_helpers():
-    step("Step 3: helper tools")
+    step("Step 3: helper tools and hardware check")
     install_packages(HELPER_PACKAGES, "helper tools")
+    check_firmware()
+    check_pci_drivers()
+
+
+def check_firmware():
+    """Install firmware the kernel asked for but couldn't find this boot.
+
+    The kernel has drivers for practically every PCIe card built in; what
+    Fedora can be missing is a card's firmware file (some Broadcom, QLogic
+    and Chelsio network cards need one). Fedora splits firmware into several
+    packages, so ask dnf which package holds each missing file."""
+    install_packages(["linux-firmware"], "base firmware")
+    log_text = run(["sudo", "journalctl", "-k", "-b", "--no-pager"], changes_system=False).stdout
+    wanted = set(re.findall(r"Direct firmware load for (\S+) failed", log_text))
+    wanted |= set(re.findall(r"firmware: failed to load (\S+)", log_text))
+    if not wanted:
+        say("No missing firmware reported by the kernel this boot")
+        return
+    packages = set()
+    for fw in sorted(wanted):
+        # Fedora stores firmware compressed (.xz/.zst), hence the trailing *.
+        r = run(["sudo", "dnf", "-q", "provides", f"/usr/lib/firmware/{fw}*"], changes_system=False)
+        first = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
+        if first:
+            # "linux-firmware-20250901-1.fc44.noarch : ..." -> "linux-firmware"
+            packages.add(first.split()[0].rsplit("-", 2)[0])
+        else:
+            warn(f"firmware {fw}: no package provides it")
+            FACTS.setdefault("firmware_missing", []).append(fw)
+    if packages:
+        install_packages(sorted(packages), "missing firmware")
+        FACTS["firmware_added"] = sorted(packages)
+        NOTES.append("Firmware was installed for hardware that was missing it; reboot so the drivers load it.")
+
+
+def check_pci_drivers():
+    """List PCI devices (network, storage, etc.) that no driver has claimed.
+    PCIe slots and risers themselves need no driver: a seated card shows up
+    in lspci, and its driver attaches automatically if Linux supports it."""
+    r = run(["lspci", "-k"], changes_system=False)
+    unclaimed, device, has_driver = [], None, False
+    for line in r.stdout.splitlines() + [""]:
+        if line and not line[0].isspace():  # a new device starts
+            if device and not has_driver:
+                unclaimed.append(device)
+            device, has_driver = line.strip(), False
+        elif "Kernel driver in use:" in line:
+            has_driver = True
+    if device and not has_driver:
+        unclaimed.append(device)
+    # Bridges and system peripherals often legitimately have no driver.
+    interesting = [d for d in unclaimed if re.search(r"Ethernet|Network|RAID|SAS|SCSI|Fibre|SATA|NVMe", d, re.I)]
+    for d in interesting:
+        warn(f"no driver attached: {d}")
+    FACTS["pci_unclaimed"] = interesting
 
 
 def step4_server_packages():
@@ -1250,6 +1311,14 @@ def step10_summary(third_party_ids):
         s.append(f"{unit}: {unit_state(unit)}")
     s.append(f"smartd watching PERC drives: {FACTS.get('smartd_drives', 0)}")
     s.append(f"Removed: {', '.join(FACTS.get('removed', [])) or 'nothing (cups/bluez already absent)'}")
+    s.append(f"Firmware added: {', '.join(FACTS.get('firmware_added', [])) or 'none needed'}"
+             + (f"; still missing: {', '.join(FACTS['firmware_missing'])}" if FACTS.get("firmware_missing") else ""))
+    s.append("Network/storage cards without a driver: "
+             + ("; ".join(FACTS.get("pci_unclaimed", [])) or "none"))
+    s.append("Backups: borgbackup and borgmatic installed. Once the storage is built: "
+             "sudo borgmatic config generate, set the repository path, then "
+             "sudo borgmatic repo-create --encryption repokey (older borgmatic: init), and "
+             "sudo systemctl enable --now borgmatic.timer")
     s.append(f"tuned profile: {output_of(['tuned-adm', 'active']).replace('Current active profile: ', '') or 'unknown'}")
 
     ip = primary_ip()
