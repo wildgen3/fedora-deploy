@@ -71,6 +71,11 @@ SERVER_PACKAGES = {
     "security": ["fail2ban"],
     "basics": ["git", "vim", "nano"],
     "storage tools": ["mdadm", "lvm2", "xfsprogs"],
+    # rasdaemon logs ECC memory and CPU hardware errors; lm_sensors reads
+    # temperatures; sysstat keeps CPU/disk/network history (sar); irqbalance
+    # spreads hardware interrupts across both CPUs; numactl shows and controls
+    # which CPU socket's memory a program uses.
+    "hardware health": ["rasdaemon", "lm_sensors", "sysstat", "irqbalance", "numactl"],
 }
 
 # fail2ban reads jail.conf, then overrides from jail.d/*.local. A separate file
@@ -515,6 +520,9 @@ def step5_services():
 
     # LVM monitoring (snapshots/mirrors) for volumes created later.
     enable_now(["lvm2-monitor.service"])
+
+    # Hardware health: error logging, performance history, interrupt spreading.
+    enable_now(["rasdaemon.service", "sysstat.service", "irqbalance.service"])
 
     say("mdmonitor: not enabled yet. It needs a real array; enable it after you create one "
         "(sudo systemctl enable --now mdmonitor).")
@@ -1089,7 +1097,8 @@ def step10_summary(third_party_ids):
             s.append(f"Package {n}: {res}")
 
     for unit in (FACTS.get("ssh_unit", "sshd.service"), "cockpit.socket", "tuned.service",
-                 "fail2ban.service", *FACTS.get("libvirt_units", []), "lvm2-monitor.service"):
+                 "fail2ban.service", *FACTS.get("libvirt_units", []), "lvm2-monitor.service",
+                 "rasdaemon.service", "sysstat.service", "irqbalance.service"):
         s.append(f"{unit}: {unit_state(unit)}")
     s.append(f"tuned profile: {output_of(['tuned-adm', 'active']).replace('Current active profile: ', '') or 'unknown'}")
 

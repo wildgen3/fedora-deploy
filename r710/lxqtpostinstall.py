@@ -18,11 +18,15 @@ Outline of what it does, in order:
      Every package is checked with `dnf info` first; missing ones are skipped.
   5. Services: sshd + Cockpit, libvirt, tuned, fail2ban (sshd jail), LVM
      monitor, and masking sleep/suspend/hibernate.
-  6. Time: America/Chicago, NTP on, 24-hour time for the command line and LXQt.
-  7. Remote desktop: xrdp + xorgxrdp, enabled at boot, each RDP login gets
-     its own LXQt desktop. No screen lock and no idle power actions.
-  8. Read-only drive report (nothing is created, wiped or formatted).
-  9. Summary (including network interfaces), then "Reboot now? [y/N]".
+  6. Time: America/Chicago, NTP on, 24-hour time for the command line,
+     the LXQt session and the panel clock (checked first, changed only if needed).
+  7. LXQt look and speed: dark mode (LXQt, Qt and GTK apps), Openbox as the
+     window manager, no compositor, so the desktop stays responsive over RDP.
+  8. Remote desktop: xrdp + xorgxrdp, enabled and verified to start at boot,
+     each RDP login gets its own LXQt desktop, network buffers tuned to cut
+     mouse lag. No screen lock and no idle power actions.
+  9. Read-only drive report (nothing is created, wiped or formatted).
+ 10. Summary (including network interfaces), then "Reboot now? [y/N]".
 
 Everything is logged to ~/postinstall-logs/. Running it twice is harmless.
 Only the Python standard library is used.
@@ -67,6 +71,11 @@ SERVER_PACKAGES = {
     "security": ["fail2ban"],
     "basics": ["git", "vim", "nano"],
     "storage tools": ["mdadm", "lvm2", "xfsprogs"],
+    # rasdaemon logs ECC memory and CPU hardware errors; lm_sensors reads
+    # temperatures; sysstat keeps CPU/disk/network history (sar); irqbalance
+    # spreads hardware interrupts across both CPUs; numactl shows and controls
+    # which CPU socket's memory a program uses.
+    "hardware health": ["rasdaemon", "lm_sensors", "sysstat", "irqbalance", "numactl"],
 }
 
 # fail2ban reads jail.conf, then overrides from jail.d/*.local. A separate file
@@ -90,6 +99,28 @@ RDP_PORT = 3389  # xrdp default; the firewall is not changed
 XRDP_PACKAGES = ["xrdp", "xorgxrdp", "xorg-x11-xinit"]
 XSESSION = "/etc/X11/xinit/Xsession"
 SKEL_XCLIENTS = "/etc/skel/.Xclients"
+
+# xrdp tuning for a snappier mouse. No Nagle delay (tcp_nodelay) so small
+# pointer updates go out at once, keepalives so dropped links are noticed,
+# and bigger socket buffers so screen updates don't stall behind each other.
+XRDP_INI = "/etc/xrdp/xrdp.ini"
+XRDP_TUNING = {
+    "tcp_nodelay": "true",
+    "tcp_keepalive": "true",
+    "tcp_send_buffer_bytes": "4194304",
+    "tcp_recv_buffer_bytes": "6291456",
+}
+# The kernel caps socket buffers at these limits, so raise them to fit
+# (it doubles the requested size internally, hence 2x the values above).
+XRDP_SYSCTL = "/etc/sysctl.d/90-xrdp-buffers.conf"
+XRDP_SYSCTL_CONTENT = f"""\
+# Managed by {SCRIPT}. Room for xrdp's larger socket buffers.
+net.core.wmem_max = 8388608
+net.core.rmem_max = 12582912
+"""
+
+# LXQt ships these under /usr/share/lxqt (themes/<name>, palettes/<name>).
+LXQT_SHARE = Path("/usr/share/lxqt")
 
 # Logs and reports go to the home directory, not next to the script.
 HOME = Path.home()
@@ -429,19 +460,23 @@ def step4_server_packages():
 
 def write_root_file(path, content, mode=None):
     """Write a root-owned file via `sudo tee`, only if its content differs.
-    mode (e.g. "755") is applied with chmod after writing."""
+    mode (e.g. "755") is applied with chmod after writing.
+    Returns True once the file has this content."""
     try:
         if Path(path).read_text() == content:
             say(f"{path}: already up to date")
-            return
+            return True
     except OSError:
         pass  # doesn't exist yet (or unreadable): write it
     run(["sudo", "mkdir", "-p", os.path.dirname(path)])
     # tee copies stdin into the file; its own stdout copy is just discarded.
     if run(["sudo", "tee", path], input_text=content).returncode != 0:
         failed(f"write {path}")
-    elif mode and run(["sudo", "chmod", mode, path]).returncode != 0:
+        return False
+    if mode and run(["sudo", "chmod", mode, path]).returncode != 0:
         failed(f"chmod {mode} {path}")
+        return False
+    return True
 
 
 def step5_services():
@@ -490,6 +525,9 @@ def step5_services():
 
     # LVM monitoring (snapshots/mirrors) for volumes created later.
     enable_now(["lvm2-monitor.service"])
+
+    # Hardware health: error logging, performance history, interrupt spreading.
+    enable_now(["rasdaemon.service", "sysstat.service", "irqbalance.service"])
 
     say("mdmonitor: not enabled yet. It needs a real array; enable it after you create one "
         "(sudo systemctl enable --now mdmonitor).")
@@ -618,42 +656,71 @@ def write_user_file(path, text, what, mode=None):
     return True
 
 
-def set_ini(path, section, key, value):
-    """Set key=value inside [section] of an INI-style file (LXQt's .conf
-    files), creating the file, section or key as needed. Other lines are
-    kept, and an existing key is replaced rather than repeated."""
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        lines = []
-    header, entry = f"[{section}]", f"{key}={value}"
-    out, in_section, done = [], False, False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            if in_section and not done:
-                # Section ended without the key: add it before the blank lines.
-                blanks = 0
-                while out and not out[-1].strip():
-                    out.pop()
-                    blanks += 1
-                out += [entry] + [""] * blanks
-                done = True
-            in_section = stripped == header
-        elif in_section and stripped.split("=", 1)[0].strip() == key:
-            if not done:
+def ini_update(lines, section, values):
+    """Return INI-style text (LXQt's .conf files, xrdp.ini) with each
+    key=value from `values` set inside [section], creating the section or
+    keys as needed. Other lines are kept, and an existing key is replaced
+    rather than repeated, so reruns never duplicate anything."""
+    for key, value in values.items():
+        header, entry = f"[{section}]", f"{key}={value}"
+        out, in_section, done = [], False, False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                if in_section and not done:
+                    # Section ended without the key: add it before the blank lines.
+                    blanks = 0
+                    while out and not out[-1].strip():
+                        out.pop()
+                        blanks += 1
+                    out += [entry] + [""] * blanks
+                    done = True
+                in_section = stripped == header
+            elif in_section and stripped.split("=", 1)[0].strip() == key:
+                if not done:
+                    out.append(entry)
+                    done = True
+                continue  # drop the old value (and any duplicates)
+            out.append(line)
+        if not done:
+            if in_section:
                 out.append(entry)
-                done = True
-            continue  # drop the old value (and any duplicates)
-        out.append(line)
-    if not done:
-        if in_section:
-            out.append(entry)
-        else:
-            if out and out[-1].strip():
-                out.append("")
-            out += [header, entry]
-    return write_user_file(path, "\n".join(out) + "\n", f"[{section}] {entry}")
+            else:
+                if out and out[-1].strip():
+                    out.append("")
+                out += [header, entry]
+        lines = out
+    return "\n".join(lines) + "\n"
+
+
+def read_lines(path):
+    try:
+        return Path(path).read_text().splitlines()
+    except OSError:
+        return []
+
+
+def set_ini(path, section, values):
+    """Set keys in a file in your home directory (no sudo)."""
+    what = f"[{section}] " + ", ".join(f"{k}={v}" for k, v in values.items())
+    return write_user_file(Path(path), ini_update(read_lines(path), section, values), what)
+
+
+def set_root_ini(path, section, values):
+    """Set keys in an existing root-owned file (read with sudo if needed,
+    written via sudo tee). Never creates the file: rewriting a config we
+    couldn't read would wipe its other settings."""
+    if not os.path.exists(path):
+        if DRY_RUN:
+            say(f"(dry run: {path} doesn't exist yet; a real run edits it after installing)")
+            return True
+        failed(f"{path} not found")
+        return False
+    r = run(["sudo", "cat", path], changes_system=False)
+    if r.returncode != 0:
+        failed(f"read {path}")
+        return False
+    return write_root_file(path, ini_update(r.stdout.splitlines(), section, values))
 
 
 def set_line(path, prefix, line):
@@ -668,16 +735,110 @@ def set_line(path, prefix, line):
     return write_user_file(path, "\n".join(out) + "\n", line.replace("\t", " "))
 
 
+def ini_sections(path):
+    """Map each [section] of an INI-style file to its key=value pairs."""
+    sections, current = {}, None
+    for line in read_lines(path):
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            current = sections.setdefault(line[1:-1], {})
+        elif current is not None and "=" in line:
+            key, value = line.split("=", 1)
+            current[key.strip()] = value.strip()
+    return sections
+
+
 def step6_lxqt_time():
     step("Step 6b: LXQt 24-hour time")
     if not FACTS.get("locale_ok"):
         return
     # LXQt's Locale settings export LC_TIME through the [Environment] group
-    # of session.conf; lxqt-session applies it at login. The panel clock
-    # uses the locale's time format, so this makes it 24-hour too.
+    # of session.conf; lxqt-session applies it at login.
     if verified("lxqt-session", ["Environment"], "LXQt session locale"):
         FACTS["lxqt_lc_time"] = set_ini(HOME / ".config/lxqt/session.conf", "Environment",
-                                        "LC_TIME", TIME_LOCALE)
+                                        {"LC_TIME": TIME_LOCALE})
+
+    # Panel clock (the "worldclock" plugin). Its default and locale-based
+    # formats are already 24-hour; only timeAMPM=true switches to AM/PM.
+    panel = HOME / ".config/lxqt/panel.conf"
+    clocks = [name for name, keys in ini_sections(panel).items() if keys.get("type") == "worldclock"]
+    if not clocks:
+        say("No clock in ~/.config/lxqt/panel.conf; LXQt's default clock is 24-hour")
+        FACTS["lxqt_clock"] = True
+    elif verified("lxqt-panel", ["timeAMPM"], "LXQt panel clock"):
+        FACTS["lxqt_clock"] = all(set_ini(panel, name, {"timeAMPM": "false"}) for name in clocks)
+
+
+# ------------------------------------------------ LXQt look and speed
+
+def find_share(kind, preferred):
+    """A dark theme or palette shipped with LXQt: `preferred` if present,
+    otherwise the first one with 'dark' in its name."""
+    folder = LXQT_SHARE / kind
+    names = sorted(p.name for p in folder.iterdir()) if folder.is_dir() else []
+    if preferred in names:
+        return preferred
+    return next((n for n in names if "dark" in n.lower()), None)
+
+
+def autostart_entries(words):
+    """XDG autostart files whose name contains any of `words`."""
+    found = set()
+    for folder in (Path("/etc/xdg/autostart"), HOME / ".config/autostart"):
+        if folder.is_dir():
+            found |= {p.name for p in folder.glob("*.desktop") if any(w in p.name.lower() for w in words)}
+    return sorted(found)
+
+
+def step7_lxqt_desktop():
+    step("Step 7: LXQt dark mode and desktop speed")
+    lxqt_conf = HOME / ".config/lxqt/lxqt.conf"
+
+    # --- Dark mode, in three layers:
+    # 1. LXQt's own theme (panel, menus): the "dark" theme it ships.
+    theme = find_share("themes", "dark")
+    if theme:
+        FACTS["dark_theme"] = set_ini(lxqt_conf, "General", {"theme": theme})
+    else:
+        skipped(f"dark LXQt theme: none found in {LXQT_SHARE}/themes")
+    # 2. Qt app colors: copy LXQt's "Dark" palette into lxqt.conf and use the
+    #    Fusion style, which follows the palette exactly.
+    palette = find_share("palettes", "Dark")
+    if palette and verified("lxqt-qtplugin", ["window_color"], "dark Qt palette"):
+        colors = ini_sections(LXQT_SHARE / "palettes" / palette).get("Palette", {})
+        FACTS["dark_palette"] = bool(colors) and all([
+            set_ini(lxqt_conf, "Palette", colors),
+            set_ini(lxqt_conf, "Qt", {"style": "Fusion"}),
+        ])
+    elif not palette:
+        skipped(f"dark Qt palette: none found in {LXQT_SHARE}/palettes")
+    # 3. GTK apps (Firefox and friends): GTK 3's built-in dark theme, and the
+    #    desktop-wide "prefer dark" flag that GTK 4 and browsers read.
+    FACTS["dark_gtk"] = all([
+        set_ini(HOME / ".config/gtk-3.0/settings.ini", "Settings",
+                {"gtk-theme-name": "Adwaita-dark", "gtk-application-prefer-dark-theme": "1"}),
+        set_ini(HOME / ".config/gtk-4.0/settings.ini", "Settings",
+                {"gtk-application-prefer-dark-theme": "1"}),
+    ])
+    if shutil.which("gsettings"):
+        key = ["org.gnome.desktop.interface", "color-scheme"]
+        if "prefer-dark" in output_of(["gsettings", "get", *key]):
+            say("color-scheme already prefer-dark")
+        elif run(["gsettings", "set", *key, "prefer-dark"]).returncode != 0:
+            failed("gsettings color-scheme prefer-dark")
+
+    # --- Speed. The R710 has no real GPU, so every visual effect is drawn
+    # by the CPUs and then has to be sent over RDP. Openbox is a plain window
+    # manager with no compositing (no shadows, fades or transparency), which
+    # is what makes the mouse and windows feel immediate.
+    install_packages(["openbox"], "Openbox window manager")
+    if (shutil.which("openbox") or DRY_RUN) and verified("lxqt-session", ["window_manager"], "window manager"):
+        FACTS["wm"] = set_ini(HOME / ".config/lxqt/session.conf", "General", {"window_manager": "openbox"})
+    # Standalone compositors that some setups autostart. A same-named file in
+    # ~/.config/autostart with Hidden=true switches one off for this user.
+    for name in autostart_entries(["picom", "compton", "xcompmgr"]):
+        write_user_file(HOME / ".config/autostart" / name,
+                        "[Desktop Entry]\nType=Application\nHidden=true\n", "compositor off")
 
 
 # ------------------------------------------- remote desktop / unattended session
@@ -694,8 +855,8 @@ def lxqt_x11_command():
     return None
 
 
-def step7_remote_session():
-    step("Step 7: remote desktop (xrdp) and unattended session")
+def step8_remote_session():
+    step("Step 8: remote desktop (xrdp) and unattended session")
 
     # xrdp is the RDP server; xorgxrdp is the X display it draws each
     # session on; xorg-x11-xinit provides the Xsession script xrdp runs.
@@ -723,6 +884,25 @@ def step7_remote_session():
     units = ["xrdp.service"] + [u for u in ("xrdp-sesman.service",) if unit_exists(u)]
     enable_now(units)
     FACTS["xrdp_units"] = units
+    # Confirm both really start at boot. "static"/"indirect" units are
+    # pulled in by another enabled unit, which also counts.
+    if not DRY_RUN:
+        states = {u: output_of(["systemctl", "is-enabled", u]) for u in units}
+        FACTS["xrdp_boot"] = all(v in ("enabled", "static", "indirect", "alias") for v in states.values())
+        if not FACTS["xrdp_boot"]:
+            failed("xrdp not set to start at boot: " + ", ".join(f"{u}={v or '?'}" for u, v in states.items()))
+    else:
+        FACTS["xrdp_boot"] = True
+
+    # --- Mouse lag: xrdp network tuning (see XRDP_TUNING), then the kernel
+    # limits that let the bigger buffers take effect.
+    if verified("xrdp", list(XRDP_TUNING), "xrdp network tuning"):
+        FACTS["xrdp_tuned"] = set_root_ini(XRDP_INI, "Globals", XRDP_TUNING)
+        if write_root_file(XRDP_SYSCTL, XRDP_SYSCTL_CONTENT):
+            if run(["sudo", "sysctl", "-p", XRDP_SYSCTL]).returncode != 0:
+                failed(f"sysctl -p {XRDP_SYSCTL}")
+        else:
+            FACTS["xrdp_tuned"] = False
 
     # --- Screen lock off. On X11, LXQt locks via xscreensaver; mode off
     # means no blanking and so no lock.
@@ -741,8 +921,8 @@ def step7_remote_session():
                 "LXQt idle power actions"):
         conf = HOME / ".config/lxqt/lxqt-powermanagement.conf"
         FACTS["power_off"] = all([
-            set_ini(conf, "General", "enableIdlenessWatcher", "false"),
-            set_ini(conf, "General", "enableIdlenessBacklightWatcher", "false"),
+            set_ini(conf, "General", {"enableIdlenessWatcher": "false",
+                                      "enableIdlenessBacklightWatcher": "false"}),
         ])
 
     NOTES.append("Log out of the server's own screen before connecting over RDP as the same user; "
@@ -825,8 +1005,8 @@ def smart_report():
     return lines
 
 
-def step8_drive_report():
-    step("Step 8: drive report (read-only)")
+def step9_drive_report():
+    step("Step 9: drive report (read-only)")
     rep = [f"Drive report - {datetime.datetime.now():%Y-%m-%d %H:%M} - {FACTS.get('release', '')}", ""]
 
     # --- where is the OS installed?
@@ -958,8 +1138,8 @@ def network_lines():
     return lines or ["Network: no physical interfaces found"]
 
 
-def step9_summary(third_party_ids):
-    step("Step 9: summary")
+def step10_summary(third_party_ids):
+    step("Step 10: summary")
     s = []
     s.append(f"Fedora: {FACTS.get('release')}, kernel {FACTS.get('kernel')}")
 
@@ -976,7 +1156,8 @@ def step9_summary(third_party_ids):
             s.append(f"Package {n}: {res}")
 
     for unit in (FACTS.get("ssh_unit", "sshd.service"), "cockpit.socket", "tuned.service",
-                 "fail2ban.service", *FACTS.get("libvirt_units", []), "lvm2-monitor.service"):
+                 "fail2ban.service", *FACTS.get("libvirt_units", []), "lvm2-monitor.service",
+                 "rasdaemon.service", "sysstat.service", "irqbalance.service"):
         s.append(f"{unit}: {unit_state(unit)}")
     s.append(f"tuned profile: {output_of(['tuned-adm', 'active']).replace('Current active profile: ', '') or 'unknown'}")
 
@@ -985,18 +1166,25 @@ def step9_summary(third_party_ids):
     s.append(f"Cockpit: https://{ip}:9090")
 
     s.append(", ".join(f"{u}: {unit_state(u)}" for u in FACTS.get("xrdp_units", ["xrdp.service"])))
+    s.append(f"xrdp starts at boot: {'yes' if FACTS.get('xrdp_boot') else 'no'}")
+    s.append(f"xrdp mouse/network tuning: {'yes' if FACTS.get('xrdp_tuned') else 'no'}")
     s.append(f"Remote desktop: in Remmina, RDP to {ip}:{RDP_PORT} and log in with your Linux "
              "username and password; each user gets their own desktop")
     s.append(f"xrdp desktop: {FACTS.get('xrdp_desktop') or 'not set'} (~/.Xclients, and {SKEL_XCLIENTS} for new users)")
     s.append(f"Screen lock off: {'yes' if FACTS.get('screenlock_off') else 'no'}")
     s.append(f"Idle power actions off: {'yes' if FACTS.get('power_off') else 'no'}")
+    s.append(f"Dark mode: LXQt theme {'yes' if FACTS.get('dark_theme') else 'no'}, "
+             f"Qt apps {'yes' if FACTS.get('dark_palette') else 'no'}, "
+             f"GTK apps {'yes' if FACTS.get('dark_gtk') else 'no'}")
+    s.append(f"Window manager Openbox (no compositing): {'yes' if FACTS.get('wm') else 'no'}")
     s += network_lines()
     s.append("Set a DHCP reservation on your router for this server's MAC so its IP never changes.")
 
     tz = output_of(["timedatectl", "show", "-p", "Timezone", "--value"]) or "unknown"
     s.append(f"Time zone: {tz}")
     s.append(f"Time format: system LC_TIME={read_locale_conf().get('LC_TIME', 'not set')}; "
-             f"LXQt LC_TIME {'set' if FACTS.get('lxqt_lc_time') else 'not set'}")
+             f"LXQt LC_TIME {'set' if FACTS.get('lxqt_lc_time') else 'not set'}; "
+             f"panel clock {'24-hour' if FACTS.get('lxqt_clock') else 'unchanged'}")
 
     s.append(f"OS disk: {FACTS.get('os_disk', 'unknown')}")
     s.append(f"Empty disks found: {FACTS.get('empty_disks', 0)} (report: {REPORT_FILE})")
@@ -1010,8 +1198,10 @@ def step9_summary(third_party_ids):
         s.append("Failed: nothing")
     for note in NOTES:
         s.append(f"Note: {note}")
-    s.append("Reboot to apply the update, kernel and desktop settings. xrdp starts at boot "
+    s.append("Reboot to apply the update, kernel, desktop and xrdp settings. xrdp starts at boot "
              "and waits for connections; no one needs to log in at the server.")
+    s.append("In Remmina, set Color depth to RemoteFX (32 bpp) and Network connection type to LAN "
+             "for the smoothest mouse.")
     s.append(f"Full log: {LOG_FILE}")
 
     say("")
@@ -1070,9 +1260,10 @@ def main():
         step5_services()
         step6_time()
         step6_lxqt_time()
-        step7_remote_session()
-        step8_drive_report()
-        step9_summary(third_party_repo_ids())
+        step7_lxqt_desktop()
+        step8_remote_session()
+        step9_drive_report()
+        step10_summary(third_party_repo_ids())
         ask_reboot()
     except KeyboardInterrupt:
         fatal("interrupted.")
