@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""postinstall.py - one-time setup for Fedora KDE Plasma on a Dell PowerEdge R710.
+"""lxqtpostinstall.py - one-time setup for the Fedora LXQt spin on a Dell PowerEdge R710.
 
 Run it as your normal (wheel/administrator) user, never as root:
 
-    python3 postinstall.py            # do everything
-    python3 postinstall.py --dry-run  # only print what would change
+    python3 lxqtpostinstall.py            # do everything
+    python3 lxqtpostinstall.py --dry-run  # only print what would change
 
 Outline of what it does, in order:
   0. Safety checks: not root, Fedora (read from /etc/os-release), user is in
@@ -12,20 +12,17 @@ Outline of what it does, in order:
      sudo alive until the end.
   1. System update: `dnf upgrade --refresh`. If this fails, the script stops.
   2. Third-party repos: `fedora-third-party enable`, then enable any of its
-     DNF repos that are still disabled (KDE quirk), then `dnf makecache`.
+     DNF repos that are still disabled, then `dnf makecache`.
   3. Helper tools (curl, wget, unzip, ...).
   4. Server packages (Cockpit, SSH, containers/VMs, monitoring, storage tools).
      Every package is checked with `dnf info` first; missing ones are skipped.
   5. Services: sshd + Cockpit, libvirt, tuned, fail2ban (sshd jail), LVM
      monitor, and masking sleep/suspend/hibernate.
-  6. Time: America/Chicago, NTP on, 24-hour time for the command line and KDE.
-  7. KDE: no animations, no blur/contrast, no Baloo file indexing.
-  8. Remote desktop and unattended session: KRDP (KDE's RDP server) starts
-     with your session and accepts your Linux login, SDDM logs you in
-     automatically, no screen lock, and no screen dimming/turn-off/suspend
-     on AC power.
-  9. Read-only drive report (nothing is created, wiped or formatted).
- 10. Summary (including network interfaces), then "Reboot now? [y/N]".
+  6. Time: America/Chicago, NTP on, 24-hour time for the command line and LXQt.
+  7. Remote desktop: xrdp + xorgxrdp, enabled at boot, each RDP login gets
+     its own LXQt desktop. No screen lock and no idle power actions.
+  8. Read-only drive report (nothing is created, wiped or formatted).
+  9. Summary (including network interfaces), then "Reboot now? [y/N]".
 
 Everything is logged to ~/postinstall-logs/. Running it twice is harmless.
 Only the Python standard library is used.
@@ -36,7 +33,6 @@ import datetime
 import grp
 import json
 import os
-import pwd
 import re
 import shlex
 import shutil
@@ -48,9 +44,11 @@ from pathlib import Path
 
 # ----------------------------------------------------------------- settings
 
+SCRIPT = "lxqtpostinstall.py"
+
 TIMEZONE = "America/Chicago"
 
-# Locale used only for time/date formats (LC_TIME), both system-wide and in KDE.
+# Locale used only for time/date formats (LC_TIME), both system-wide and in LXQt.
 #   en_GB.UTF-8 -> 24-hour time, but dates switch to day-first order (23/09/2026).
 #   en_DK.UTF-8 -> 24-hour time with ISO dates (2026-09-23).
 TIME_LOCALE = "en_GB.UTF-8"
@@ -74,8 +72,8 @@ SERVER_PACKAGES = {
 # fail2ban reads jail.conf, then overrides from jail.d/*.local. A separate file
 # leaves jail.conf untouched, and rewriting the whole file avoids duplicate lines.
 FAIL2BAN_JAIL = "/etc/fail2ban/jail.d/sshd.local"
-FAIL2BAN_CONTENT = """\
-# Managed by postinstall.py. Enables the sshd jail.
+FAIL2BAN_CONTENT = f"""\
+# Managed by {SCRIPT}. Enables the sshd jail.
 [sshd]
 enabled  = true
 # Ban an address for 1 hour after 5 failed logins within 10 minutes.
@@ -84,44 +82,20 @@ findtime = 10m
 bantime  = 1h
 """
 
-# Plasma config keys known to be correct, by Plasma major version. On an
-# unlisted version the matching setting is skipped with a warning.
-KNOWN_PLASMA_KEYS = {
-    6: {
-        "plasma-localerc/Formats/LC_TIME",
-        "appletsrc/digitalclock/Appearance/use24hFormat",
-        "kdeglobals/KDE/AnimationDurationFactor",
-        "kwinrc/Plugins/blurEnabled",
-        "kwinrc/Plugins/contrastEnabled",
-        "krdpserverrc/General/SystemUserEnabled",
-        "krdpserverrc/General/Autostart",
-        "kscreenlockerrc/Daemon/Autolock",
-        "kscreenlockerrc/Daemon/LockOnResume",
-        "powerdevilrc/AC/Display/DimDisplayWhenIdle",
-        "powerdevilrc/AC/Display/TurnOffDisplayWhenIdle",
-        "powerdevilrc/AC/SuspendAndShutdown/AutoSuspendAction",
-    },
-}
+RDP_PORT = 3389  # xrdp default; the firewall is not changed
 
-# SDDM (the login screen) reads every file in sddm.conf.d; autologin gets its own.
-SDDM_AUTOLOGIN = "/etc/sddm.conf.d/autologin.conf"
-
-RDP_PORT = 3389  # KRDP default; the firewall is not changed
-
-# xdg-desktop-portal's permission store. KRDP shares the screen through the
-# portal, which normally shows an "allow remote control?" dialog on the
-# server's own screen. System Settings > Remote Desktop pre-approves KRDP with
-# this entry; the script writes the same one so no one has to click it.
-PORTAL_STORE = ["org.freedesktop.impl.portal.PermissionStore",
-                "/org/freedesktop/impl/portal/PermissionStore",
-                "org.freedesktop.impl.portal.PermissionStore"]
-KRDP_PORTAL_ENTRY = ["kde-authorized", "remote-desktop", "org.kde.krdpserver"]  # table, id, app
+# xrdp starts a desktop by running /etc/X11/xinit/Xsession, which runs the
+# user's ~/.Xclients. A copy in /etc/skel means accounts created later
+# (e.g. a friend's) get LXQt too.
+XRDP_PACKAGES = ["xrdp", "xorgxrdp", "xorg-x11-xinit"]
+XSESSION = "/etc/X11/xinit/Xsession"
+SKEL_XCLIENTS = "/etc/skel/.Xclients"
 
 # Logs and reports go to the home directory, not next to the script.
 HOME = Path.home()
 LOG_DIR = HOME / "postinstall-logs"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-LOG_FILE = LOG_DIR / f"postinstall-{STAMP}.log"
+LOG_FILE = LOG_DIR / f"{SCRIPT[:-3]}-{STAMP}.log"
 REPORT_FILE = LOG_DIR / f"drive-report-{STAMP}.txt"
 
 # ------------------------------------------------------------------ state
@@ -249,8 +223,8 @@ def check_fedora():
     FACTS["release"] = info.get("PRETTY_NAME", f"Fedora {info.get('VERSION_ID', '?')}")
     FACTS["kernel"] = os.uname().release
     say(f"Detected: {FACTS['release']} (kernel {FACTS['kernel']})")
-    if info.get("VARIANT_ID") != "kde":
-        warn(f"expected the KDE edition, found variant '{info.get('VARIANT_ID', 'none')}'. Continuing.")
+    if info.get("VARIANT_ID") != "lxqt":
+        warn(f"expected the LXQt spin, found variant '{info.get('VARIANT_ID', 'none')}'. Continuing.")
 
 
 def check_wheel():
@@ -424,7 +398,7 @@ def step2_third_party_repos(dnf5):
     if run(["sudo", "fedora-third-party", "enable"]).returncode != 0:
         failed("fedora-third-party enable")
 
-    # KDE quirk: repos can end up added but still disabled. Enable any that are.
+    # Repos can end up added but still disabled. Enable any that are.
     states = repo_states()
     for repo_id in third_party_repo_ids():
         if states.get(repo_id) == "enabled":
@@ -453,8 +427,9 @@ def step4_server_packages():
         install_packages(names, label)
 
 
-def write_root_file(path, content):
-    """Write a root-owned file via `sudo tee`, only if its content differs."""
+def write_root_file(path, content, mode=None):
+    """Write a root-owned file via `sudo tee`, only if its content differs.
+    mode (e.g. "755") is applied with chmod after writing."""
     try:
         if Path(path).read_text() == content:
             say(f"{path}: already up to date")
@@ -465,6 +440,8 @@ def write_root_file(path, content):
     # tee copies stdin into the file; its own stdout copy is just discarded.
     if run(["sudo", "tee", path], input_text=content).returncode != 0:
         failed(f"write {path}")
+    elif mode and run(["sudo", "chmod", mode, path]).returncode != 0:
+        failed(f"chmod {mode} {path}")
 
 
 def step5_services():
@@ -504,7 +481,7 @@ def step5_services():
     elif run(["sudo", "tuned-adm", "profile", TUNED_PROFILE]).returncode != 0:
         failed(f"tuned-adm profile {TUNED_PROFILE}")
     if unit_exists("tuned-ppd.service"):
-        NOTES.append("tuned-ppd (KDE's power-profile bridge) is installed. If KDE's power profile is "
+        NOTES.append("tuned-ppd (the desktop power-profile bridge) is installed. If the power profile is "
                      "changed it can switch tuned away from throughput-performance; check `tuned-adm active`.")
 
     # fail2ban: bans IPs that keep failing SSH logins.
@@ -578,116 +555,12 @@ def step6_time():
             failed("localectl set-locale")
 
 
-# ------------------------------------------------ KDE (per-user, no sudo)
-
-def plasma_major():
-    """Installed Plasma major version, from the plasma-workspace package."""
-    version = output_of(["rpm", "-q", "--qf", "%{VERSION}", "plasma-workspace"])
-    return int(version.split(".")[0]) if version[:1].isdigit() else None
-
-
-def key_known(major, key):
-    if key in KNOWN_PLASMA_KEYS.get(major, set()):
-        return True
-    skipped(f"KDE setting {key}: not verified for Plasma {major}")
-    return False
-
-
-def kwrite(filename, groups, key, value):
-    """kwriteconfig6 as the current user (no sudo) -> lands in ~/.config.
-    Repeating --group walks into nested groups like [A][B][C]."""
-    cmd = ["kwriteconfig6", "--file", filename]
-    for g in groups:
-        cmd += ["--group", g]
-    cmd += ["--key", key, str(value)]
-    if run(cmd).returncode != 0:
-        failed(f"kwriteconfig6 {filename} {key}")
-        return False
-    return True
-
-
-def find_clock_applets():
-    """Find Digital Clock widgets in the panel config file.
-    Returns group paths like ['Containments', '2', 'Applets', '19']."""
-    path = HOME / ".config/plasma-org.kde.plasma.desktop-appletsrc"
-    try:
-        text = path.read_text()
-    except OSError:
-        return []
-    found, group = [], None
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("[") and line.endswith("]"):
-            group = line[1:-1].split("][")
-        elif line == "plugin=org.kde.plasma.digitalclock" and group and len(group) == 4:
-            found.append(group)
-    return found
-
-
-def kde_setup():
-    """Checks shared by steps 6 (KDE part) and 7. Returns Plasma major or None."""
-    if not shutil.which("kwriteconfig6"):
-        skipped("KDE settings: kwriteconfig6 not found")
-        return None
-    major = plasma_major()
-    if major is None:
-        skipped("KDE settings: couldn't read the Plasma version")
-        return None
-    say(f"Plasma {major} detected")
-    return major
-
-
-def step6_kde_time(major):
-    step("Step 6b: KDE 24-hour time")
-    if major is None or not FACTS.get("locale_ok"):
-        return
-
-    # Plasma's Region & Language settings: time formats come from LC_TIME.
-    if key_known(major, "plasma-localerc/Formats/LC_TIME"):
-        FACTS["kde_lc_time"] = kwrite("plasma-localerc", ["Formats"], "LC_TIME", TIME_LOCALE)
-
-    # Panel clock: use24hFormat 0 = 12-hour, 1 = follow region, 2 = 24-hour.
-    if key_known(major, "appletsrc/digitalclock/Appearance/use24hFormat"):
-        clocks = find_clock_applets()
-        if not clocks:
-            skipped("24-hour panel clock: no Digital Clock widget found in the panel config")
-        for group in clocks:
-            if kwrite("plasma-org.kde.plasma.desktop-appletsrc", group + ["Configuration", "Appearance"],
-                      "use24hFormat", 2):
-                FACTS["kde_clock"] = True
-
-
-def step7_kde_effects(major):
-    step("Step 7: KDE desktop effects")
-    if major is None:
-        return
-    # 0 = animations finish instantly.
-    if key_known(major, "kdeglobals/KDE/AnimationDurationFactor"):
-        kwrite("kdeglobals", ["KDE"], "AnimationDurationFactor", 0)
-    # Blur and background contrast are GPU-heavy KWin effects.
-    if key_known(major, "kwinrc/Plugins/blurEnabled"):
-        kwrite("kwinrc", ["Plugins"], "blurEnabled", "false")
-    if key_known(major, "kwinrc/Plugins/contrastEnabled"):
-        kwrite("kwinrc", ["Plugins"], "contrastEnabled", "false")
-
-    # Baloo indexes file contents in the background; not wanted on a server.
-    baloo = shutil.which("balooctl6")
-    if not baloo:
-        skipped("Baloo: balooctl6 not found")
-    elif output_of(["kreadconfig6", "--file", "baloofilerc", "--group", "Basic Settings",
-                    "--key", "Indexing-Enabled"]) == "false":
-        say("Baloo file indexing already disabled")
-    elif run([baloo, "disable"]).returncode != 0:
-        failed("balooctl6 disable")
-
-
-# ------------------------------------------- remote desktop / unattended session
+# ------------------------------------------------ LXQt (per-user, no sudo)
 
 def package_has_keys(package, names):
     """Check an installed package really uses these config names by looking
-    for them inside its files. KDE compiles its config definitions into its
-    libraries, where Qt stores strings as UTF-16, so look for both encodings.
-    Returns the names that were NOT found (all of them if not installed)."""
+    for them inside its files (Qt programs keep them as plain or UTF-16
+    strings). Returns the names NOT found (all of them if not installed)."""
     missing = set(names)
     r = run(["rpm", "-ql", package], changes_system=False)
     if r.returncode != 0:
@@ -695,8 +568,8 @@ def package_has_keys(package, names):
     for path in r.stdout.split():
         if not missing:
             break
-        # Only libraries, programs and config definitions can contain them.
-        if not (".so" in path or "/bin/" in path or "/libexec/" in path or path.endswith((".kcfg", ".xml"))):
+        # Only libraries and programs can contain them.
+        if not (".so" in path or "/bin/" in path or "/libexec/" in path):
             continue
         p = Path(path)
         if p.is_symlink() or not p.is_file():
@@ -711,153 +584,169 @@ def package_has_keys(package, names):
     return missing
 
 
-def keys_verified(major, table_keys, package, names):
-    """Both checks: known for this Plasma version, and present in the package."""
-    if not all(key_known(major, k) for k in table_keys):
-        return False
+def verified(package, names, what):
+    """Only write settings the installed package actually uses."""
     missing = package_has_keys(package, names)
     if missing:
-        skipped(f"{package}: config names {', '.join(sorted(missing))} not found in the installed package")
+        skipped(f"{what}: {', '.join(sorted(missing))} not found in the installed {package} package")
         return False
     return True
 
 
-def find_krdp_unit():
-    """KRDP's systemd user unit, looked up rather than assumed
-    (app-org.kde.krdpserver.service at the time of writing)."""
-    r = run(["systemctl", "--user", "list-unit-files", "--no-legend"], changes_system=False)
-    names = [line.split()[0] for line in r.stdout.splitlines() if line.strip()]
-    units = [u for u in names if "krdp" in u.lower() and u.endswith(".service")]
-    # If there's more than one, the server unit is the one we want.
-    units.sort(key=lambda u: "krdpserver" not in u.lower())
-    return units[0] if units else None
+def write_user_file(path, text, what, mode=None):
+    """Write a file in the home directory (no sudo), only if it changed."""
+    try:
+        if path.read_text() == text and (mode is None or path.stat().st_mode & 0o777 == mode):
+            say(f"{path}: already up to date")
+            return True
+    except OSError:
+        pass
+    if DRY_RUN:
+        say(f"[dry-run] write {path} ({what})")
+        for line in text.splitlines():
+            say(f"[dry-run]     {line}")
+        return True
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        if mode is not None:
+            path.chmod(mode)
+    except OSError as err:
+        failed(f"write {path}: {err}")
+        return False
+    say(f"wrote {path} ({what})")
+    return True
 
 
-def sddm_overrides():
-    """Other SDDM config files that also set [Autologin] User/Session and are
-    read after ours (files are read in name order, /etc/sddm.conf last),
-    which would quietly override it."""
-    later = sorted(str(p) for p in Path("/etc/sddm.conf.d").glob("*.conf") if p.name > "autologin.conf")
-    found = []
-    for path in later + ["/etc/sddm.conf"]:
-        try:
-            lines = Path(path).read_text().splitlines()
-        except OSError:
-            continue
-        section = ""
-        for line in lines:
-            line = line.strip()
-            if line.startswith("["):
-                section = line
-            elif section == "[Autologin]" and line.startswith(("User=", "Session=")):
-                found.append(path)
-                break
-    return found
+def set_ini(path, section, key, value):
+    """Set key=value inside [section] of an INI-style file (LXQt's .conf
+    files), creating the file, section or key as needed. Other lines are
+    kept, and an existing key is replaced rather than repeated."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    header, entry = f"[{section}]", f"{key}={value}"
+    out, in_section, done = [], False, False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_section and not done:
+                # Section ended without the key: add it before the blank lines.
+                blanks = 0
+                while out and not out[-1].strip():
+                    out.pop()
+                    blanks += 1
+                out += [entry] + [""] * blanks
+                done = True
+            in_section = stripped == header
+        elif in_section and stripped.split("=", 1)[0].strip() == key:
+            if not done:
+                out.append(entry)
+                done = True
+            continue  # drop the old value (and any duplicates)
+        out.append(line)
+    if not done:
+        if in_section:
+            out.append(entry)
+        else:
+            if out and out[-1].strip():
+                out.append("")
+            out += [header, entry]
+    return write_user_file(path, "\n".join(out) + "\n", f"[{section}] {entry}")
 
 
-def krdp_settings(major):
-    """What System Settings > Remote Desktop would otherwise need clicking."""
-    # SystemUserEnabled: log in over RDP with your own Linux username and
-    # password (checked by PAM) instead of a separate RDP account whose
-    # password lives in KWallet. KRDP only accepts the user who owns the
-    # session. Autostart mirrors the "start on login" switch.
-    if keys_verified(major, ["krdpserverrc/General/SystemUserEnabled", "krdpserverrc/General/Autostart"],
-                     "krdp", ["SystemUserEnabled", "Autostart"]):
-        FACTS["rdp_pam"] = all([
-            kwrite("krdpserverrc", ["General"], "SystemUserEnabled", "true"),
-            kwrite("krdpserverrc", ["General"], "Autostart", "true"),
-        ])
+def set_line(path, prefix, line):
+    """Make sure the file has exactly one line starting with prefix."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    out = [l for l in lines if not l.startswith(prefix)]
+    first = next((n for n, l in enumerate(lines) if l.startswith(prefix)), len(out))
+    out.insert(min(first, len(out)), line)
+    return write_user_file(path, "\n".join(out) + "\n", line.replace("\t", " "))
 
-    # Pre-approve screen sharing (see PORTAL_STORE). busctl talks to the
-    # session's D-Bus; --user means as you, no sudo.
-    if package_has_keys("krdp", KRDP_PORTAL_ENTRY[:1]):
-        skipped("screen-sharing pre-approval: this krdp version doesn't use the kde-authorized table")
+
+def step6_lxqt_time():
+    step("Step 6b: LXQt 24-hour time")
+    if not FACTS.get("locale_ok"):
         return
-    current = run(["busctl", "--user", "call", *PORTAL_STORE, "GetPermission", "sss",
-                   KRDP_PORTAL_ENTRY[0], KRDP_PORTAL_ENTRY[1], KRDP_PORTAL_ENTRY[2]], changes_system=False)
-    if current.returncode == 0 and '"yes"' in current.stdout:
-        say("KRDP screen sharing already pre-approved")
-        FACTS["rdp_preapproved"] = True
-    elif run(["busctl", "--user", "call", *PORTAL_STORE, "SetPermission", "sbssas",
-              KRDP_PORTAL_ENTRY[0], "true", KRDP_PORTAL_ENTRY[1], KRDP_PORTAL_ENTRY[2],
-              "1", "yes"]).returncode == 0:
-        FACTS["rdp_preapproved"] = True
+    # LXQt's Locale settings export LC_TIME through the [Environment] group
+    # of session.conf; lxqt-session applies it at login. The panel clock
+    # uses the locale's time format, so this makes it 24-hour too.
+    if verified("lxqt-session", ["Environment"], "LXQt session locale"):
+        FACTS["lxqt_lc_time"] = set_ini(HOME / ".config/lxqt/session.conf", "Environment",
+                                        "LC_TIME", TIME_LOCALE)
+
+
+# ------------------------------------------- remote desktop / unattended session
+
+def lxqt_x11_command():
+    """The command that starts LXQt on X11, read from its session file.
+    xrdp runs an X11 desktop, so a Wayland-only session can't be used."""
+    for f in sorted(Path("/usr/share/xsessions").glob("*.desktop")):
+        if "lxqt" not in f.name.lower():
+            continue
+        for line in f.read_text().splitlines():
+            if line.startswith("Exec="):
+                return line[len("Exec="):].strip()
+    return None
+
+
+def step7_remote_session():
+    step("Step 7: remote desktop (xrdp) and unattended session")
+
+    # xrdp is the RDP server; xorgxrdp is the X display it draws each
+    # session on; xorg-x11-xinit provides the Xsession script xrdp runs.
+    install_packages(XRDP_PACKAGES, "xrdp remote desktop")
+
+    # Tell xrdp logins to start LXQt: ~/.Xclients for you, /etc/skel for
+    # accounts made later. Without it, Xsession falls back to another desktop.
+    command = lxqt_x11_command()
+    if command is None and DRY_RUN:
+        command = "startlxqt"
+        say("(dry run: no LXQt X11 session file found; assuming startlxqt)")
+    if command is None:
+        skipped("xrdp desktop: no LXQt session in /usr/share/xsessions")
     else:
-        failed("pre-approve KRDP screen sharing (busctl SetPermission)")
+        xclients = f"#!/bin/sh\n# Managed by {SCRIPT}: desktop started for xrdp logins.\nexec {command}\n"
+        ok_home = write_user_file(HOME / ".Xclients", xclients, "desktop for xrdp logins", 0o755)
+        write_root_file(SKEL_XCLIENTS, xclients, mode="755")
+        FACTS["xrdp_desktop"] = command if ok_home else None
+        if not DRY_RUN and not os.path.exists(XSESSION):
+            warn(f"{XSESSION} is missing, so xrdp may not run ~/.Xclients")
 
+    # enable --now: start xrdp now and at every boot, so RDP works after a
+    # restart without anyone logging in at the server. xrdp-sesman (the
+    # session manager) is a separate unit on current Fedora.
+    units = ["xrdp.service"] + [u for u in ("xrdp-sesman.service",) if unit_exists(u)]
+    enable_now(units)
+    FACTS["xrdp_units"] = units
 
-def step8_remote_session(major):
-    step("Step 8: remote desktop and unattended session")
-    user = pwd.getpwuid(os.getuid()).pw_name
-
-    # --- KRDP, KDE's RDP server. It shares the logged-in Plasma session, so it
-    # relies on the autologin below.
-    if run(["rpm", "-q", "krdp"], changes_system=False).returncode == 0:
-        say("krdp already installed")
-    else:
-        install_packages(["krdp"], "KRDP remote desktop")
-    krdp_present = run(["rpm", "-q", "krdp"], changes_system=False).returncode == 0
-    FACTS["krdp_installed"] = DRY_RUN or krdp_present
-
-    unit = find_krdp_unit()
-    FACTS["krdp_unit"] = unit
-    if unit:
-        # --user: the per-user systemd instance (no sudo); starts with the session.
-        if output_of(["systemctl", "--user", "is-enabled", unit]) == "enabled":
-            say(f"{unit}: already enabled")
-        elif run(["systemctl", "--user", "enable", unit]).returncode != 0:
-            failed(f"systemctl --user enable {unit}")
-    elif DRY_RUN:
-        say("(dry run: KRDP isn't installed yet, so its user unit can't be looked up; "
-            "a real run would enable it with systemctl --user enable)")
-    else:
-        skipped("KRDP autostart: no krdp unit in `systemctl --user list-unit-files`")
-
-    # --- SDDM autologin into the Plasma Wayland session. The session name is
-    # the .desktop file name in /usr/share/wayland-sessions/ without '.desktop'.
-    sessions = sorted(p.stem for p in Path("/usr/share/wayland-sessions").glob("*.desktop"))
-    session = "plasma" if "plasma" in sessions else next((s for s in sessions if "plasma" in s), None)
-    if not session:
-        skipped(f"SDDM autologin: no Plasma session in /usr/share/wayland-sessions (found: {', '.join(sessions) or 'none'})")
-        FACTS["autologin"] = "no (Plasma Wayland session not found)"
-    else:
-        write_root_file(SDDM_AUTOLOGIN, f"# Managed by postinstall.py.\n"
-                                        f"[Autologin]\nUser={user}\nSession={session}\n")
-        FACTS["autologin"] = f"yes ({user}, session {session})"
-        overrides = sddm_overrides()
-        if overrides:
-            warn(f"{', '.join(overrides)} also set [Autologin] and are read after {SDDM_AUTOLOGIN}")
-            FACTS["autologin"] += f", but overridden by {', '.join(overrides)}"
-
-    if major is None:
-        return  # kwriteconfig6 or Plasma version missing; already reported
-
-    if krdp_present:
-        krdp_settings(major)
-    elif DRY_RUN:
-        say("(dry run: krdp isn't installed yet; a real run turns on Linux-login RDP "
-            "and pre-approves screen sharing here)")
-
-    # --- Screen lock off: never lock after idle, and don't lock on wake.
-    if keys_verified(major, ["kscreenlockerrc/Daemon/Autolock", "kscreenlockerrc/Daemon/LockOnResume"],
-                     "kscreenlocker", ["Autolock", "LockOnResume"]):
+    # --- Screen lock off. On X11, LXQt locks via xscreensaver; mode off
+    # means no blanking and so no lock.
+    if shutil.which("xscreensaver"):
         FACTS["screenlock_off"] = all([
-            kwrite("kscreenlockerrc", ["Daemon"], "Autolock", "false"),
-            kwrite("kscreenlockerrc", ["Daemon"], "LockOnResume", "false"),
+            set_line(HOME / ".xscreensaver", "mode:", "mode:\t\toff"),
+            set_line(HOME / ".xscreensaver", "lock:", "lock:\t\tFalse"),
+        ])
+    else:
+        say("xscreensaver isn't installed, so nothing locks the screen")
+        FACTS["screenlock_off"] = True
+
+    # --- Power: with the idleness watchers off, LXQt takes no action (dim,
+    # screen off, suspend, lock) when the session sits idle.
+    if verified("lxqt-powermanagement", ["enableIdlenessWatcher", "enableIdlenessBacklightWatcher"],
+                "LXQt idle power actions"):
+        conf = HOME / ".config/lxqt/lxqt-powermanagement.conf"
+        FACTS["power_off"] = all([
+            set_ini(conf, "General", "enableIdlenessWatcher", "false"),
+            set_ini(conf, "General", "enableIdlenessBacklightWatcher", "false"),
         ])
 
-    # --- Power management on AC (Plasma 6 layout: [AC][Display] and
-    # [AC][SuspendAndShutdown] in powerdevilrc). AutoSuspendAction 0 = do nothing.
-    if keys_verified(major, ["powerdevilrc/AC/Display/DimDisplayWhenIdle",
-                             "powerdevilrc/AC/Display/TurnOffDisplayWhenIdle",
-                             "powerdevilrc/AC/SuspendAndShutdown/AutoSuspendAction"],
-                     "powerdevil", ["DimDisplayWhenIdle", "TurnOffDisplayWhenIdle",
-                                    "SuspendAndShutdown", "AutoSuspendAction"]):
-        FACTS["power_off"] = all([
-            kwrite("powerdevilrc", ["AC", "Display"], "DimDisplayWhenIdle", "false"),
-            kwrite("powerdevilrc", ["AC", "Display"], "TurnOffDisplayWhenIdle", "false"),
-            kwrite("powerdevilrc", ["AC", "SuspendAndShutdown"], "AutoSuspendAction", 0),
-        ])
+    NOTES.append("Log out of the server's own screen before connecting over RDP as the same user; "
+                 "two desktops for one user at once can conflict.")
 
 
 # ------------------------------------------------------ drive report (read-only)
@@ -936,8 +825,8 @@ def smart_report():
     return lines
 
 
-def step9_drive_report():
-    step("Step 9: drive report (read-only)")
+def step8_drive_report():
+    step("Step 8: drive report (read-only)")
     rep = [f"Drive report - {datetime.datetime.now():%Y-%m-%d %H:%M} - {FACTS.get('release', '')}", ""]
 
     # --- where is the OS installed?
@@ -1069,8 +958,8 @@ def network_lines():
     return lines or ["Network: no physical interfaces found"]
 
 
-def step10_summary(third_party_ids):
-    step("Step 10: summary")
+def step9_summary(third_party_ids):
+    step("Step 9: summary")
     s = []
     s.append(f"Fedora: {FACTS.get('release')}, kernel {FACTS.get('kernel')}")
 
@@ -1095,29 +984,19 @@ def step10_summary(third_party_ids):
     s.append(f"Hostname: {socket.gethostname()}")
     s.append(f"Cockpit: https://{ip}:9090")
 
-    unit = FACTS.get("krdp_unit")
-    autostart = bool(unit) and output_of(["systemctl", "--user", "is-enabled", unit]) == "enabled"
-    s.append(f"KRDP installed: {'yes' if FACTS.get('krdp_installed') else 'no'}; "
-             f"autostart enabled: {'yes' if autostart else 'no'}{f' ({unit})' if unit else ''}")
-    s.append(f"Remote desktop: in Remmina, RDP to {ip}:{RDP_PORT}")
-    if FACTS.get("rdp_pam"):
-        s.append(f"RDP login: your Linux username ({pwd.getpwuid(os.getuid()).pw_name}) and password")
-    else:
-        s.append("RDP login: set an RDP username/password once in System Settings > Remote Desktop")
-        NOTES.append("Autologin doesn't unlock KWallet, where KRDP keeps RDP passwords. If RDP logins fail "
-                     "after a reboot, set an empty wallet password in KWalletManager.")
-    s.append(f"RDP screen sharing pre-approved: {'yes' if FACTS.get('rdp_preapproved') else 'no'}")
-    s.append(f"Autologin: {FACTS.get('autologin', 'no')}")
+    s.append(", ".join(f"{u}: {unit_state(u)}" for u in FACTS.get("xrdp_units", ["xrdp.service"])))
+    s.append(f"Remote desktop: in Remmina, RDP to {ip}:{RDP_PORT} and log in with your Linux "
+             "username and password; each user gets their own desktop")
+    s.append(f"xrdp desktop: {FACTS.get('xrdp_desktop') or 'not set'} (~/.Xclients, and {SKEL_XCLIENTS} for new users)")
     s.append(f"Screen lock off: {'yes' if FACTS.get('screenlock_off') else 'no'}")
-    s.append(f"Power settings (no dim, no screen off, no suspend on AC): {'yes' if FACTS.get('power_off') else 'no'}")
+    s.append(f"Idle power actions off: {'yes' if FACTS.get('power_off') else 'no'}")
     s += network_lines()
     s.append("Set a DHCP reservation on your router for this server's MAC so its IP never changes.")
 
     tz = output_of(["timedatectl", "show", "-p", "Timezone", "--value"]) or "unknown"
     s.append(f"Time zone: {tz}")
     s.append(f"Time format: system LC_TIME={read_locale_conf().get('LC_TIME', 'not set')}; "
-             f"KDE LC_TIME {'set' if FACTS.get('kde_lc_time') else 'not set'}; "
-             f"panel clock {'24-hour' if FACTS.get('kde_clock') else 'unchanged'}")
+             f"LXQt LC_TIME {'set' if FACTS.get('lxqt_lc_time') else 'not set'}")
 
     s.append(f"OS disk: {FACTS.get('os_disk', 'unknown')}")
     s.append(f"Empty disks found: {FACTS.get('empty_disks', 0)} (report: {REPORT_FILE})")
@@ -1131,8 +1010,8 @@ def step10_summary(third_party_ids):
         s.append("Failed: nothing")
     for note in NOTES:
         s.append(f"Note: {note}")
-    s.append("Reboot (or at least log out) to apply the update, kernel, KDE settings, "
-             "autologin, screen lock, power settings and KRDP autostart.")
+    s.append("Reboot to apply the update, kernel and desktop settings. xrdp starts at boot "
+             "and waits for connections; no one needs to log in at the server.")
     s.append(f"Full log: {LOG_FILE}")
 
     say("")
@@ -1160,20 +1039,20 @@ def ask_reboot():
 def main():
     global DRY_RUN, LOG
 
-    parser = argparse.ArgumentParser(description="Fedora KDE post-install setup for a Dell R710.")
+    parser = argparse.ArgumentParser(description="Fedora LXQt post-install setup for a Dell R710.")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every command that would change the system, without running it")
     DRY_RUN = parser.parse_args().dry_run
 
-    # Root would put KDE settings and logs in /root instead of your home.
+    # Root would put desktop settings and logs in /root instead of your home.
     if os.geteuid() == 0:
         print("Don't run this as root or with sudo. Rerun it as your normal user:\n"
-              "    python3 postinstall.py")
+              f"    python3 {SCRIPT}")
         sys.exit(1)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     LOG = open(LOG_FILE, "w")
-    say(f"postinstall.py started {datetime.datetime.now():%Y-%m-%d %H:%M:%S}"
+    say(f"{SCRIPT} started {datetime.datetime.now():%Y-%m-%d %H:%M:%S}"
         f"{' (DRY RUN: nothing will be changed)' if DRY_RUN else ''}")
     say(f"Log: {LOG_FILE}")
 
@@ -1190,12 +1069,10 @@ def main():
         step4_server_packages()
         step5_services()
         step6_time()
-        major = kde_setup()
-        step6_kde_time(major)
-        step7_kde_effects(major)
-        step8_remote_session(major)
-        step9_drive_report()
-        step10_summary(third_party_repo_ids())
+        step6_lxqt_time()
+        step7_remote_session()
+        step8_drive_report()
+        step9_summary(third_party_repo_ids())
         ask_reboot()
     except KeyboardInterrupt:
         fatal("interrupted.")
