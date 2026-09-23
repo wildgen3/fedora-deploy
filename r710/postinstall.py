@@ -21,8 +21,9 @@ Outline of what it does, in order:
   6. Time: America/Chicago, NTP on, 24-hour time for the command line and KDE.
   7. KDE: no animations, no blur/contrast, no Baloo file indexing.
   8. Remote desktop and unattended session: KRDP (KDE's RDP server) starts
-     with your session, SDDM logs you in automatically, no screen lock, and
-     no screen dimming/turn-off/suspend on AC power.
+     with your session and accepts your Linux login, SDDM logs you in
+     automatically, no screen lock, and no screen dimming/turn-off/suspend
+     on AC power.
   9. Read-only drive report (nothing is created, wiped or formatted).
  10. Summary (including network interfaces), then "Reboot now? [y/N]".
 
@@ -92,6 +93,8 @@ KNOWN_PLASMA_KEYS = {
         "kdeglobals/KDE/AnimationDurationFactor",
         "kwinrc/Plugins/blurEnabled",
         "kwinrc/Plugins/contrastEnabled",
+        "krdpserverrc/General/SystemUserEnabled",
+        "krdpserverrc/General/Autostart",
         "kscreenlockerrc/Daemon/Autolock",
         "kscreenlockerrc/Daemon/LockOnResume",
         "powerdevilrc/AC/Display/DimDisplayWhenIdle",
@@ -104,6 +107,15 @@ KNOWN_PLASMA_KEYS = {
 SDDM_AUTOLOGIN = "/etc/sddm.conf.d/autologin.conf"
 
 RDP_PORT = 3389  # KRDP default; the firewall is not changed
+
+# xdg-desktop-portal's permission store. KRDP shares the screen through the
+# portal, which normally shows an "allow remote control?" dialog on the
+# server's own screen. System Settings > Remote Desktop pre-approves KRDP with
+# this entry; the script writes the same one so no one has to click it.
+PORTAL_STORE = ["org.freedesktop.impl.portal.PermissionStore",
+                "/org/freedesktop/impl/portal/PermissionStore",
+                "org.freedesktop.impl.portal.PermissionStore"]
+KRDP_PORTAL_ENTRY = ["kde-authorized", "remote-desktop", "org.kde.krdpserver"]  # table, id, app
 
 # Logs and reports go to the home directory, not next to the script.
 HOME = Path.home()
@@ -743,6 +755,37 @@ def sddm_overrides():
     return found
 
 
+def krdp_settings(major):
+    """What System Settings > Remote Desktop would otherwise need clicking."""
+    # SystemUserEnabled: log in over RDP with your own Linux username and
+    # password (checked by PAM) instead of a separate RDP account whose
+    # password lives in KWallet. KRDP only accepts the user who owns the
+    # session. Autostart mirrors the "start on login" switch.
+    if keys_verified(major, ["krdpserverrc/General/SystemUserEnabled", "krdpserverrc/General/Autostart"],
+                     "krdp", ["SystemUserEnabled", "Autostart"]):
+        FACTS["rdp_pam"] = all([
+            kwrite("krdpserverrc", ["General"], "SystemUserEnabled", "true"),
+            kwrite("krdpserverrc", ["General"], "Autostart", "true"),
+        ])
+
+    # Pre-approve screen sharing (see PORTAL_STORE). busctl talks to the
+    # session's D-Bus; --user means as you, no sudo.
+    if package_has_keys("krdp", KRDP_PORTAL_ENTRY[:1]):
+        skipped("screen-sharing pre-approval: this krdp version doesn't use the kde-authorized table")
+        return
+    current = run(["busctl", "--user", "call", *PORTAL_STORE, "GetPermission", "sss",
+                   KRDP_PORTAL_ENTRY[0], KRDP_PORTAL_ENTRY[1], KRDP_PORTAL_ENTRY[2]], changes_system=False)
+    if current.returncode == 0 and '"yes"' in current.stdout:
+        say("KRDP screen sharing already pre-approved")
+        FACTS["rdp_preapproved"] = True
+    elif run(["busctl", "--user", "call", *PORTAL_STORE, "SetPermission", "sbssas",
+              KRDP_PORTAL_ENTRY[0], "true", KRDP_PORTAL_ENTRY[1], KRDP_PORTAL_ENTRY[2],
+              "1", "yes"]).returncode == 0:
+        FACTS["rdp_preapproved"] = True
+    else:
+        failed("pre-approve KRDP screen sharing (busctl SetPermission)")
+
+
 def step8_remote_session(major):
     step("Step 8: remote desktop and unattended session")
     user = pwd.getpwuid(os.getuid()).pw_name
@@ -753,7 +796,8 @@ def step8_remote_session(major):
         say("krdp already installed")
     else:
         install_packages(["krdp"], "KRDP remote desktop")
-    FACTS["krdp_installed"] = DRY_RUN or run(["rpm", "-q", "krdp"], changes_system=False).returncode == 0
+    krdp_present = run(["rpm", "-q", "krdp"], changes_system=False).returncode == 0
+    FACTS["krdp_installed"] = DRY_RUN or krdp_present
 
     unit = find_krdp_unit()
     FACTS["krdp_unit"] = unit
@@ -784,11 +828,15 @@ def step8_remote_session(major):
         if overrides:
             warn(f"{', '.join(overrides)} also set [Autologin] and are read after {SDDM_AUTOLOGIN}")
             FACTS["autologin"] += f", but overridden by {', '.join(overrides)}"
-        NOTES.append("Autologin doesn't unlock KWallet. If KRDP prompts for the wallet or RDP logins fail "
-                     "after a reboot, set an empty wallet password in KWalletManager.")
 
     if major is None:
         return  # kwriteconfig6 or Plasma version missing; already reported
+
+    if krdp_present:
+        krdp_settings(major)
+    elif DRY_RUN:
+        say("(dry run: krdp isn't installed yet; a real run turns on Linux-login RDP "
+            "and pre-approves screen sharing here)")
 
     # --- Screen lock off: never lock after idle, and don't lock on wake.
     if keys_verified(major, ["kscreenlockerrc/Daemon/Autolock", "kscreenlockerrc/Daemon/LockOnResume"],
@@ -1052,7 +1100,13 @@ def step10_summary(third_party_ids):
     s.append(f"KRDP installed: {'yes' if FACTS.get('krdp_installed') else 'no'}; "
              f"autostart enabled: {'yes' if autostart else 'no'}{f' ({unit})' if unit else ''}")
     s.append(f"Remote desktop: in Remmina, RDP to {ip}:{RDP_PORT}")
-    s.append("RDP login: set the RDP username/password once in System Settings > Remote Desktop")
+    if FACTS.get("rdp_pam"):
+        s.append(f"RDP login: your Linux username ({pwd.getpwuid(os.getuid()).pw_name}) and password")
+    else:
+        s.append("RDP login: set an RDP username/password once in System Settings > Remote Desktop")
+        NOTES.append("Autologin doesn't unlock KWallet, where KRDP keeps RDP passwords. If RDP logins fail "
+                     "after a reboot, set an empty wallet password in KWalletManager.")
+    s.append(f"RDP screen sharing pre-approved: {'yes' if FACTS.get('rdp_preapproved') else 'no'}")
     s.append(f"Autologin: {FACTS.get('autologin', 'no')}")
     s.append(f"Screen lock off: {'yes' if FACTS.get('screenlock_off') else 'no'}")
     s.append(f"Power settings (no dim, no screen off, no suspend on AC): {'yes' if FACTS.get('power_off') else 'no'}")
