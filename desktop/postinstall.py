@@ -24,7 +24,8 @@ off (you can also just run the same command again):
            groups. Then a validation pass: every item is checked, anything
            missing is retried once, and a pass/fail table is printed. Reboot.
   Stage 3  Sign-in: git identity, SSH key, GitHub, Google Cloud, Claude,
-           Gemini, Codex, Hugging Face, Tailscale and API keys, then each app
+           Gemini, Codex, Hugging Face, Google Drive (mounted at ~/GoogleDrive),
+           Tailscale and API keys, then each app
            that needs a sign-in is opened one at a time. Anything skipped is
            written to a to-do file on your Desktop.
 
@@ -132,6 +133,8 @@ RPM_GROUPS = {
     # @virtualization = QEMU/KVM + libvirt + virt-manager. swtpm (virtual TPM)
     # and edk2-ovmf (UEFI) are what Windows 11 VMs need.
     "virtual machines": ["@virtualization", "swtpm", "swtpm-tools", "edk2-ovmf"],
+    # rclone mounts Google Drive as a folder (FUSE); see GDRIVE_* below.
+    "Google Drive mount": ["rclone", "fuse3"],
     # steam-devices: udev rules so controllers (and the Steam Deck) work.
     "gaming (host side)": ["steam-devices", "gamemode"],
 }
@@ -339,11 +342,63 @@ STREAMING_PORTS = {
 }
 SUNSHINE_WEB_UI = "https://localhost:47990"
 
+# ---- Google Drive and Google Docs
+
+# Google Drive as a real folder that every app can use: rclone mounts it at
+# ~/GoogleDrive, started with your session by a systemd user service. Files are
+# cached locally as you use them (--vfs-cache-mode full), so apps can edit them
+# normally. Google Docs/Sheets/Slides show up as .docx/.xlsx/.pptx exports. The
+# service is enabled once you sign in (stage 3, or --auth later).
+GDRIVE_REMOTE = "gdrive"
+GDRIVE_DIR = Path.home() / "GoogleDrive"
+GDRIVE_UNIT = "rclone-gdrive.service"
+GDRIVE_UNIT_FILE = Path.home() / ".config/systemd/user" / GDRIVE_UNIT
+GDRIVE_UNIT_CONTENT = f"""\
+# Managed by {SCRIPT}. Google Drive at ~/GoogleDrive (rclone remote "{GDRIVE_REMOTE}").
+[Unit]
+Description=Google Drive at ~/GoogleDrive (rclone)
+
+[Service]
+# rclone tells systemd when the mount is ready.
+Type=notify
+ExecStartPre=/usr/bin/mkdir -p %h/GoogleDrive
+ExecStart=/usr/bin/rclone mount {GDRIVE_REMOTE}: %h/GoogleDrive \\
+    --vfs-cache-mode full --vfs-cache-max-size 20G --vfs-cache-max-age 720h \\
+    --dir-cache-time 1h --poll-interval 1m
+ExecStop=/usr/bin/fusermount3 -uz %h/GoogleDrive
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+"""
+
+# Google's "Google Docs Offline" extension, pre-installed through a Chrome
+# policy file. normal_installed: installed for you, but you can still remove
+# it. (Any policy file makes Chrome show "Managed by your organization".)
+DOCS_OFFLINE_EXTENSION = "ghbmnnjooekpmoecnnnilnnbdlolhkhi"
+CHROME_POLICY = "/etc/opt/chrome/policies/managed/desktop-postinstall.json"
+CHROME_POLICY_CONTENT = json.dumps({"ExtensionSettings": {DOCS_OFFLINE_EXTENSION: {
+    "installation_mode": "normal_installed",
+    "update_url": "https://clients2.google.com/service/update2/crx"}}}, indent=2) + "\n"
+
+# Menu entries that open Google apps in their own Chrome window (--app).
+GOOGLE_APPS = {
+    "google-docs": ("Google Docs", "https://docs.google.com/document/", "x-office-document"),
+    "google-sheets": ("Google Sheets", "https://docs.google.com/spreadsheets/", "x-office-spreadsheet"),
+    "google-slides": ("Google Slides", "https://docs.google.com/presentation/", "x-office-presentation"),
+    "google-gmail": ("Gmail", "https://mail.google.com/", "internet-mail"),
+    "google-drive": ("Google Drive (web)", "https://drive.google.com/", "folder-cloud"),
+}
+
 # ---- stage 3: apps that need a sign-in, opened one at a time
 
 # (label, .desktop ids to try, what to do there)
 SIGNIN_APPS = [
-    ("Google Chrome", ["google-chrome"], "Sign in to Google and turn on sync."),
+    ("Google Chrome", ["google-chrome"],
+     "Sign in to Google and turn on sync. Then, for offline Docs/Sheets/Slides: "
+     "drive.google.com > Settings (gear) > Offline > turn it on. For Gmail: Gmail > "
+     "Settings > See all settings > Offline."),
     ("VS Code", ["code"],
      "Accounts (bottom left) > Backup and Sync Settings. Then sign in to Claude Code, "
      "Gemini Code Assist, Codex and Cline from their sidebar icons."),
@@ -1122,6 +1177,29 @@ def installed_vscode_extensions():
     return set(output_of(["code", "--list-extensions"]).lower().split())
 
 
+def setup_google_drive():
+    step("Google Drive mount and Google Docs offline")
+    write_user_file(GDRIVE_UNIT_FILE, GDRIVE_UNIT_CONTENT)
+    run(["systemctl", "--user", "daemon-reload"])
+    if gdrive_signed_in():
+        # Already signed in (a re-run): make sure the mount starts with the session.
+        if not unit_enabled(GDRIVE_UNIT, user=True):
+            run(["systemctl", "--user", "enable", "--now", GDRIVE_UNIT])
+    else:
+        say("The mount starts once you sign in to Google Drive (stage 3, or --auth).")
+    write_root_file(CHROME_POLICY, CHROME_POLICY_CONTENT)
+    for key, (name, url, icon) in GOOGLE_APPS.items():
+        write_user_file(HOME / ".local/share/applications" / f"{key}.desktop", f"""\
+[Desktop Entry]
+Type=Application
+Name={name}
+Exec=google-chrome-stable --app={url}
+Icon={icon}
+Terminal=false
+Categories=Office;Network;
+""")
+
+
 def install_vscode_extensions():
     step("VS Code extensions")
     if not shutil.which("code") and not DRY_RUN:
@@ -1377,6 +1455,7 @@ def stage2_install():
     install_shell_config()
     install_vscode_extensions()
     install_antigravity()
+    setup_google_drive()
     gpu_settings()
     setup_services()
 
@@ -1435,6 +1514,11 @@ def collect_checks():
     for group in GROUPS:
         rows.append(("group", group, user_in_group(group)))
     rows.append(("shell", "~/.bashrc.d snippet", SHELL_SNIPPET.exists()))
+    rows.append(("google", "Drive mount service file", GDRIVE_UNIT_FILE.exists()))
+    rows.append(("google", "Docs Offline extension policy", Path(CHROME_POLICY).exists()))
+    for key, (name, _, _) in GOOGLE_APPS.items():
+        rows.append(("google", f"{name} menu entry",
+                     (HOME / ".local/share/applications" / f"{key}.desktop").exists()))
     return rows
 
 
@@ -1451,6 +1535,7 @@ RETRY = {
     "service": setup_services,
     "group": setup_services,
     "shell": install_shell_config,
+    "google": setup_google_drive,
 }
 
 
@@ -1594,6 +1679,30 @@ def tailscale_login():
     interactive(["sudo", "tailscale", "up", f"--operator={username()}"])
 
 
+def gdrive_signed_in():
+    """True once the rclone remote for Google Drive exists."""
+    return f"{GDRIVE_REMOTE}:" in output_of(["rclone", "listremotes"]).split()
+
+
+def gdrive_login():
+    if not gdrive_signed_in():
+        say("   Your browser opens to let rclone use your Google Drive.")
+        say("   Optional: your own Google OAuth client ID avoids the rate limits of rclone's")
+        say("   shared one (guide: rclone.org/drive/#making-your-own-client-id).")
+        client_id = ask("   Client ID (Enter = rclone's shared one): ")
+        extra = []
+        if client_id:
+            try:
+                secret = getpass.getpass("   Client secret (hidden): ").strip()
+            except EOFError:
+                secret = ""
+            extra = [f"client_id={client_id}", f"client_secret={secret}"]
+        interactive(["rclone", "config", "create", GDRIVE_REMOTE, "drive", "scope=drive", *extra])
+    if gdrive_signed_in():
+        run(["systemctl", "--user", "enable", "--now", GDRIVE_UNIT])
+        say(f"   Google Drive is at {GDRIVE_DIR} (drag it to Dolphin's Places panel for quick access).")
+
+
 def read_api_keys():
     keys = {}
     try:
@@ -1712,6 +1821,10 @@ def stage3_signin():
     signin("Gemini CLI", GEMINI_CREDS.exists, gemini_login, "Gemini CLI: run `gemini` and log in with Google")
     signin("Codex CLI", lambda: succeeds(["codex", "login", "status"]), codex_login, "codex login")
     signin("Hugging Face", lambda: succeeds(["hf", "auth", "whoami"]), hf_login, "hf auth login")
+    signin("Google Drive mount (~/GoogleDrive)",
+           lambda: gdrive_signed_in() and unit_enabled(GDRIVE_UNIT, user=True), gdrive_login,
+           f"Google Drive mount: python3 {INSTALLED_COPY} --auth (or rclone config create "
+           f"{GDRIVE_REMOTE} drive, then systemctl --user enable --now {GDRIVE_UNIT})")
     signin("Tailscale", lambda: succeeds(["tailscale", "status"]), tailscale_login,
            f"sudo tailscale up --operator={username()}")
     api_keys()

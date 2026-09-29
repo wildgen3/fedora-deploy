@@ -16,7 +16,7 @@ python3 postinstall.py
 |---|---|---|
 | 1. Clean base | Hardware detection, system update (dnf), firmware (fwupd: pending updates listed first; laptops must be on the charger), Flatpak updates | Reboot |
 | 2. Install | Repos, RPMs, Flatpaks, AI CLIs, agent SDKs, VS Code extensions, Antigravity, GPU drivers for the detected AMD or Intel GPU, services. Then a validation pass: each item is checked, anything missing is retried once, and a pass/fail table is printed. | Reboot |
-| 3. Sign-in | git, SSH key, GitHub, gcloud (+ ADC), Claude, Gemini, Codex, Hugging Face, Tailscale, API keys, then each app that needs a sign-in | To-do file on the Desktop |
+| 3. Sign-in | git, SSH key, GitHub, gcloud (+ ADC), Claude, Gemini, Codex, Hugging Face, Google Drive mount, Tailscale, API keys, then each app that needs a sign-in | To-do file on the Desktop |
 
 After each reboot, Konsole opens by itself once you log in and continues. You can also just run `python3 postinstall.py` again.
 
@@ -39,6 +39,7 @@ Logs: `~/postinstall-logs/`. Re-running is safe; finished steps are skipped.
 | Agent SDKs | anthropic, claude-agent-sdk, google-genai, google-adk, openai, openai-agents, mcp, litellm | `~/.venvs/agents` (activate with `agents`) |
 | Local AI | ollama, ramalama, llama.cpp, ROCm runtime | Fedora |
 | Cloud | Google Cloud CLI, GKE auth plugin, kubectl, skaffold | Google RPM repo |
+| Google Drive and Docs | Drive mounted at `~/GoogleDrive` (rclone), Google Docs Offline extension, Docs/Sheets/Slides/Gmail/Drive menu entries (Chrome app windows) | Fedora; Chrome Web Store via Chrome policy |
 | Remote | Remmina (RDP, VNC, KWallet passwords), Tailscale | Fedora; Tailscale RPM repo |
 | Virtual machines | QEMU/KVM, libvirt, virt-manager, swtpm, UEFI, virtio-win drivers | Fedora; virtio-win repo |
 | Gaming and streaming | Steam (+ MangoHud, gamescope, vkBasalt), ProtonPlus, Sunshine, Moonlight, OBS + VkCapture | Flathub; Sunshine's COPR |
@@ -55,4 +56,6 @@ The package lists are at the top of the script. Edit them there.
 - **Hardware detection:** every run reads the maker, model, CPU, GPUs, whether it's a laptop, and charger state. Firmware updates are skipped in VMs, and pending updates are listed before flashing. On a laptop the script waits for the charger before the system update and firmware. GPU drivers match the GPU found.
 - **Antigravity:** Google publishes 2.x for Linux only as tarballs on antigravity.google/download (2026-09-29: Antigravity 2.18.1, IDE 2.5.5). The script reads that page for the current versions and also checks Google's older RPM repo. The IDE installs from the RPM repo only if that has caught up. Tarball installs go to `~/.local/opt` and can't update themselves, so when Antigravity says an update is out, run `--stage 2` again.
 - **ChatGPT:** OpenAI publishes no key URL, so the script installs the first RPM directly. That RPM adds OpenAI's signed repo, and later updates come through `dnf upgrade`.
+- **Google Drive:** rclone mounts Drive at `~/GoogleDrive` as a real folder that every app can use. Files are cached locally as you open them, and Google Docs appear as .docx/.xlsx/.pptx. The mount service is set up in stage 2 and starts once you sign in (stage 3 or `--auth`). For heavy use, your own Google OAuth client ID avoids rclone's shared rate limits; the sign-in asks for one and it's optional.
+- **Docs offline:** the Docs Offline extension is pre-installed through a Chrome policy (Chrome will say "Managed by your organization"; that's this file: `/etc/opt/chrome/policies/managed/desktop-postinstall.json`). Turn offline on once in Drive's settings; stage 3 reminds you.
 - **Steam Deck streaming:** install Moonlight on the Deck from Discover, then pair it with Sunshine at `https://localhost:47990`. Steam Remote Play works too, with no setup.
