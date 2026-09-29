@@ -1,0 +1,17 @@
+# Codec swaps: Fedora package -> RPM Fusion build of the same thing. Fedora
+# strips patented video codecs; these put them back. If the Fedora package
+# isn't installed, the replacement is just installed.
+# Format:  fedora-package   replacement   # what it's for
+
+[every machine]
+ffmpeg-free                     ffmpeg                              # FFmpeg with every codec: HEVC/H.265 in Firefox, Dolphin thumbnails, KDE players, x264/x265
+
+[AMD GPU | amd-gpu]
+mesa-va-drivers                 mesa-va-drivers-freeworld           # AMD hardware H.264/H.265 video decode/encode (Sunshine, OBS, browsers)
+mesa-vdpau-drivers?             mesa-vdpau-drivers-freeworld?       # the same for the VDPAU video API some players use
+mesa-va-drivers.i686?           mesa-va-drivers-freeworld.i686?     # 32-bit version, matched for Steam's 32-bit side
+mesa-vdpau-drivers.i686?        mesa-vdpau-drivers-freeworld.i686?  # 32-bit VDPAU, matched for Steam
+
+[Intel GPU | intel-gpu]
+libva-intel-media-driver        intel-media-driver                  # Intel hardware video decode/encode, full codec set
+libva-intel-media-driver.i686?  intel-media-driver.i686?            # 32-bit version, matched for Steam's 32-bit side

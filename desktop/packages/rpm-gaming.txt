@@ -1,0 +1,16 @@
+# Gaming and streaming. Steam is RPM Fusion's package; it pulls in the 32-bit
+# libraries games need (the 32-bit codec drivers are matched in swaps.txt).
+
+[Steam]
+steam               # Steam, Remote Play included (RPM Fusion)
+steam-devices       # udev rules so controllers and the Steam Deck work
+
+[game tools]
+gamemode            # Feral GameMode: performance governor (and AMD GPU clocks) while a game runs; per game: gamemoderun %command%
+mangohud            # in-game overlay: FPS, frame times, temperatures, clocks; logs to CSV
+gamescope           # Valve's micro-compositor: scaling, frame limits, HDR, fullscreen fixes
+vkBasalt            # Vulkan post-processing (sharpening, etc.)
+obs-vkcapture?      # lets OBS capture Vulkan/OpenGL games directly (not in every release)
+
+[streaming]
+Sunshine            # streams this PC to Moonlight, e.g. the Steam Deck (Sunshine's COPR)

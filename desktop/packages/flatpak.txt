@@ -1,0 +1,24 @@
+# Flathub apps, installed for your user. Steam is the RPM Fusion package
+# (rpm-gaming.txt), not a Flatpak.
+
+[apps]
+com.discordapp.Discord          # Discord
+com.spotify.Client              # Spotify
+md.obsidian.Obsidian            # Obsidian: notes
+com.orcaslicer.OrcaSlicer       # OrcaSlicer: filament 3D printers
+io.mango3d.LycheeSlicer         # Lychee Slicer: resin 3D printers
+
+[gaming and streaming]
+com.vysp3r.ProtonPlus                       # ProtonPlus: installs GE-Proton / Proton-CachyOS builds
+com.obsproject.Studio                       # OBS Studio: recording and streaming
+com.obsproject.Studio.Plugin.OBSVkCapture   # OBS game capture plugin
+com.moonlight_stream.Moonlight              # Moonlight: game streaming client
+
+[Heroic | opt:heroic]
+com.heroicgameslauncher.hgl     # Heroic: Epic, GOG and Amazon games
+
+[Lutris | opt:lutris]
+net.lutris.Lutris               # Lutris: other stores and emulators
+
+[TuneD Switcher | opt:tuned-switcher]
+org.easycoding.TunedSwitcher    # TuneD Switcher: any tuned profile

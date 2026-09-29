@@ -1,0 +1,14 @@
+# Agent SDKs in the shared ~/.venvs/agents environment (`agents` activates it).
+# Format:  pip-package   import-name (checked by the validation pass)   # what it's for
+
+[SDKs]
+anthropic           anthropic           # Claude API
+claude-agent-sdk    claude_agent_sdk    # Claude Agent SDK
+google-genai        google.genai        # Gemini API
+google-adk          google.adk          # Google Agent Development Kit
+openai              openai              # OpenAI API
+openai-agents       agents              # OpenAI Agents SDK
+mcp                 mcp                 # Model Context Protocol
+litellm             litellm             # one API for many model providers
+python-dotenv       dotenv              # loads .env files
+ipykernel           ipykernel           # lets Jupyter/VS Code notebooks use this environment

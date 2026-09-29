@@ -2,22 +2,23 @@
 
 Personal software, tooling and CachyOS-style performance tweaks for a fresh **Fedora KDE Plasma** desktop or laptop. It's separate from the server scripts.
 
-Fedora's own packages stay in place. Every tweak is added as a separate file you can delete to revert it, and the only package swaps are the RPM Fusion codec drivers. Packages come from Fedora, RPM Fusion, the vendor's own repo, a developer's own COPR (plus the CachyOS project's addons COPR, limited to the packages listed below), or Flathub.
+Fedora's own packages stay in place. Every tweak is added as a separate file you can delete to revert it, and the only package swaps are RPM Fusion's full-codec builds (ffmpeg and the GPU video drivers). Packages come from Fedora, RPM Fusion, the vendor's own repo, a developer's own COPR (plus the CachyOS project's addons COPR, limited to the packages listed below), or Flathub.
 
 ## Run it
 
 Install Fedora KDE, log in, open Konsole:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop/postinstall.py
-python3 postinstall.py --dry-run   # preview, changes nothing
-python3 postinstall.py
+curl -fsSL https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop/bootstrap.sh | bash -s -- --dry-run   # preview
+curl -fsSL https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop/bootstrap.sh | bash
 ```
+
+`bootstrap.sh` installs git if it's missing, clones the repo to `~/.local/share/desktop-postinstall/repo` (or pulls the latest on a re-run), and starts `desktop/postinstall.py` from there, so the script and its package lists always come from the same version. To test a branch, set `BRANCH=<name>` before `bash`.
 
 | Stage | What happens | Ends with |
 |---|---|---|
 | 1. Clean base | Hardware detection, system update, firmware (pending updates listed, installed after you confirm; laptops must be on the charger), Flatpak updates | Reboot |
-| 2. Install (Phase A) | Repos, packages, Flatpaks, AI CLIs and SDKs, VS Code extensions, Antigravity, Google Drive mount, performance tweaks, kernel arguments, GPU tooling, laptop power settings, Framework hibernation (swap file + resume). Then a validation pass that retries anything missing once. | Reboot |
+| 2. Install (Phase A) | Core tools first (git, CLI, code tools), then repos, codec swaps, packages, old Flatpak Steam cleanup, Flatpaks, AI CLIs and SDKs, VS Code extensions, Antigravity, Google Drive mount, performance tweaks, kernel arguments, GPU tooling, laptop power settings, Framework hibernation (swap file + resume). Then a validation pass that retries anything missing once. | Reboot |
 | 3. Configure and sign in (Phase B) | Checks that kernel arguments and daemons are live, GameMode AMD GPU settings, variable refresh rate, Phoronix Test Suite and MangoHud logging, lid close = hibernate (Framework) with a test, every sign-in, each app | To-do file on the Desktop |
 | 4. Baseline benchmarks (Phase C) | Runs `~/.config/desktop-postinstall/benchmarks.txt` at stock settings; results go to `~/benchmarks/<machine>/` | Offered at the end of stage 3, or `--benchmark` later |
 
@@ -35,6 +36,8 @@ After each reboot, Konsole opens by itself once you log in and continues. You ca
 
 Logs: `~/postinstall-logs/`. Re-running is safe; finished steps are skipped.
 
+**When something doesn't install:** a group that fails is retried one package at a time, so one bad package can't block the rest. Every failure, and every problem in a package list (file and line number), is listed at the end with the reason, which is dnf's (or npm's, flatpak's, ...) own error text. The same list is saved to `~/postinstall-logs/problems-<time>.txt`, and the full output is in the log.
+
 ## Hardware detection
 
 Every run reads the hardware first and applies only the matching blocks. One machine can match several.
@@ -50,7 +53,7 @@ Every run reads the hardware first and applies only the matching blocks. One mac
 
 ## What gets installed
 
-The full list, one line per package with what it's for, is `RPM_GROUPS` at the top of the script. Edit it there.
+The package lists are the `.txt` files in [`packages/`](packages/), one line per package with what it's for. The format is in [`packages/README.md`](packages/README.md). Each file loads on its own, so a mistake in one line is reported and skipped and everything else still installs.
 
 | Area | Items | Source |
 |---|---|---|
@@ -62,7 +65,9 @@ The full list, one line per package with what it's for, is `RPM_GROUPS` at the t
 | Google Drive and Docs | Drive mounted at `~/GoogleDrive` (rclone), Docs Offline extension, Docs/Sheets/Slides/Gmail/Drive menu entries | Fedora; Chrome policy |
 | Remote | Remmina, Tailscale | Fedora; Tailscale repo |
 | Virtual machines | QEMU/KVM, libvirt, virt-manager, swtpm, UEFI, virtio-win | Fedora; virtio-win repo |
-| Gaming | Steam (Flatpak, + MangoHud/gamescope/vkBasalt layers), ProtonPlus, GameMode, MangoHud, gamescope, Sunshine, Moonlight, OBS + VkCapture | Flathub; Fedora; Sunshine's COPR |
+| Core (first) | git, git-lfs, gh, CLI tools, Python 3.13, uv, Node + npm, gcc/make, podman | Fedora |
+| Gaming | Steam (RPM Fusion, with its 32-bit libraries), ProtonPlus, GameMode, MangoHud, gamescope, vkBasalt, Sunshine, Moonlight, OBS + VkCapture | RPM Fusion; Fedora; Flathub; Sunshine's COPR |
+| Codecs | Full ffmpeg on every machine; AMD: freeworld VA/VDPAU drivers (64- and 32-bit); Intel: intel-media-driver (64- and 32-bit) | RPM Fusion (`packages/swaps.txt`) |
 | Process priority | ananicy-cpp + CachyOS rules (as-is); your overrides in `/etc/ananicy.d/99-custom/` | CachyOS addons COPR |
 | Power | tuned + tuned-ppd (Fedora's standard mapping, unchanged) | Fedora |
 | Benchmarking and monitoring | phoronix-test-suite, vkmark, glmark2, stress-ng, sysbench, kernel-tools (turbostat), s-tui, lm_sensors, powertop, vulkan-tools, vainfo | Fedora |
@@ -90,12 +95,12 @@ On a Framework laptop, closing the lid puts it in the lowest-drain state, which 
 
 ## Opt-in extras (`--with`)
 
-`heroic`, `lutris`, `scx` (sched_ext schedulers + tools + GUI), `rt-tests`, `fio`, `tuned-switcher`, `full-ffmpeg`, `thermald` (Intel), `ryzenadj` (AMD), `zenpower` (AMD; third-party COPR, needs Secure Boot off), `igpu-overclock` (laptop AMD iGPU), `framework-tool`, `audio-no-powersave`.
+`heroic`, `lutris`, `scx` (sched_ext schedulers + tools + GUI), `rt-tests`, `fio`, `tuned-switcher`, `thermald` (Intel), `ryzenadj` (AMD), `zenpower` (AMD; off for now: third-party COPR, and with Secure Boot on it needs an enrolled signing key), `igpu-overclock` (laptop AMD iGPU), `framework-tool`, `audio-no-powersave`.
 
 ## Verify by hand
 
 ```bash
-python3 ~/.local/share/desktop-postinstall/postinstall.py --check   # all of the below in one table
+python3 ~/.local/share/desktop-postinstall/repo/desktop/postinstall.py --check   # all of the below in one table
 cat /proc/cmdline; tuned-adm active; powerprofilesctl get
 systemctl status ananicy-cpp tuned lactd
 sysctl vm.swappiness vm.max_map_count net.ipv4.tcp_congestion_control
@@ -108,4 +113,5 @@ cat /sys/power/mem_sleep /sys/power/state; swapon --show; mokutil --sb-state
 - **API keys** go in `~/.config/api-keys.env` (mode 600) and are loaded only by `agents`. Exported globally, they would make the Claude, Gemini and Codex CLIs bill the key instead of your subscription.
 - **Antigravity** is installed from Google's Linux download to `~/.local/opt`. Those copies can't update themselves, so when Antigravity says an update is out, run `--stage 2` again.
 - **Steam Deck streaming:** install Moonlight on the Deck from Discover, then pair it with Sunshine at `https://localhost:47990`. Steam Remote Play works too.
-- **MangoHud logs** go to `~/benchmarks/<machine>/mangohud` (Shift_L+F2 to start and stop). Flatpak Steam is given access to `~/benchmarks` for this.
+- **MangoHud logs** go to `~/benchmarks/<machine>/mangohud` (Shift_L+F2 to start and stop).
+- **Steam is RPM Fusion's package.** If an earlier run installed the Flatpak Steam, stage 2 removes it, its Vulkan layers and its sandbox permission, then the Flatpak runtimes nothing uses any more, including its 32-bit GL and i386 libraries. Its game files in `~/.var/app/com.valvesoftware.Steam` are kept: add them as a library in Steam (Settings > Storage) or delete them. The RPM's 32-bit libraries are ordinary dnf dependencies: `sudo dnf remove steam && sudo dnf autoremove` takes them out again.

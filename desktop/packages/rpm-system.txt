@@ -1,0 +1,29 @@
+# System: process priority, power, monitoring, benchmarking, codecs.
+
+[process priority]
+ananicy-cpp             # sets process priority from rules: games up, compilers/indexers/backups down
+cachyos-ananicy-rules   # CachyOS's rules database, used as-is (your overrides: /etc/ananicy.d/99-custom/)
+
+[power]
+tuned                   # Fedora's power/performance profile daemon
+tuned-ppd               # lets KDE's power menu (Power Saver / Balanced / Performance) drive tuned
+
+[monitoring]
+lm_sensors              # CPU/board temperatures and fan speeds (feeds MangoHud and KDE widgets)
+powertop                # what draws power and what wakes the system; --csv output
+vulkan-tools            # vulkaninfo and friends, for diagnosing Vulkan
+libva-utils             # vainfo: checks hardware video decode/encode
+
+[benchmarking]
+phoronix-test-suite     # repeatable, unattended benchmarks; results kept local (upload off)
+vkmark                  # Vulkan GPU benchmark
+glmark2                 # OpenGL GPU benchmark
+stress-ng               # CPU/memory/cache stress: stability and thermal soak after tuning
+sysbench                # quick CPU and memory throughput benchmarks
+kernel-tools            # turbostat (per-core clocks, C-states, package power) and cpupower
+s-tui                   # terminal UI: stress test with live frequency/temperature/power graphs
+
+[codecs (RPM Fusion)]
+gstreamer1-plugins-bad-freeworld    # GStreamer codecs Fedora can't ship
+gstreamer1-plugins-ugly             # more GStreamer codecs
+gstreamer1-plugin-libav             # GStreamer's FFmpeg-based codecs

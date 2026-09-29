@@ -1,0 +1,17 @@
+# Installed only on machines that match the block after the "|".
+
+[AMD GPU | amd-gpu]
+lact                # AMD GPU control: clocks, undervolt, power limit, fan curves (+ lactd daemon; developer's COPR)
+rocm-hip            # ROCm runtime: ollama and other apps compute on the AMD GPU
+rocm-opencl         # OpenCL on ROCm
+rocminfo            # shows what ROCm sees
+
+[Intel GPU | intel-gpu]
+igt-gpu-tools       # intel_gpu_top: live Intel GPU usage
+
+[hibernation | hibernate]
+policycoreutils-python-utils    # semanage, to label the hibernation swap file for SELinux
+mokutil                         # reads the Secure Boot state
+
+[Framework AMD | framework-amd]
+amd-debug-tools?    # amd_s2idle: AMD sleep diagnostics (not in every release)

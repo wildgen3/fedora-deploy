@@ -1,0 +1,37 @@
+# Apps from the vendors' own repos (added in stage 2) and Fedora.
+
+[Google Chrome]
+google-chrome-stable    # Chrome browser (Google's repo)
+
+[VS Code]
+code                    # Visual Studio Code (Microsoft's repo)
+
+[ChatGPT]
+chatgpt                 # ChatGPT desktop, with Codex (OpenAI's repo)
+
+[Google Cloud CLI]
+google-cloud-cli                          # gcloud
+google-cloud-cli-gke-gcloud-auth-plugin   # sign-in plugin for GKE clusters
+kubectl                                   # Kubernetes CLI
+google-cloud-cli-skaffold                 # build/deploy loop for Kubernetes apps
+
+[Tailscale]
+tailscale               # private network between your machines (Tailscale's repo)
+
+[remote desktop]
+remmina                     # remote desktop client
+remmina-plugins-rdp         # RDP: Windows, and KDE's KRDP
+remmina-plugins-vnc         # VNC
+remmina-plugins-secret      # saves passwords in KWallet (Secret Service)
+remmina-plugins-kwallet?    # direct KWallet plugin (not in every release)
+
+[virtual machines]
+@virtualization         # QEMU/KVM, libvirt and virt-manager
+swtpm                   # virtual TPM chip (Windows 11 needs one)
+swtpm-tools             # swtpm setup tools
+edk2-ovmf               # UEFI firmware for VMs
+virtio-win              # Windows VM drivers ISO (virtio-win repo)
+
+[Google Drive mount]
+rclone                  # mounts Google Drive at ~/GoogleDrive
+fuse3                   # lets rclone mount it as a normal folder

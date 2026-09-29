@@ -1,0 +1,6 @@
+# npm packages, installed into ~/.local (no sudo).
+# Format:  package   command-it-provides   # what it's for
+
+[AI CLIs]
+@google/gemini-cli      gemini      # Gemini CLI
+@openai/codex           codex       # Codex CLI

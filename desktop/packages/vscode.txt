@@ -1,0 +1,19 @@
+# VS Code extensions (Marketplace IDs).
+
+[extensions]
+ms-vscode-remote.remote-ssh         # Remote - SSH: edit and run on your servers
+anthropic.claude-code               # Claude Code
+google.geminicodeassist             # Gemini Code Assist
+saoudrizwan.claude-dev              # Cline
+openai.chatgpt                      # Codex (OpenAI)
+ms-python.python                    # Python
+ms-python.vscode-pylance            # Pylance
+charliermarsh.ruff                  # Ruff
+ms-toolsai.jupyter                  # Jupyter
+googlecloudtools.cloudcode          # Cloud Code
+github.vscode-pull-request-github   # GitHub Pull Requests
+redhat.vscode-yaml                  # YAML
+tamasfe.even-better-toml            # Even Better TOML
+usernamehw.errorlens                # Error Lens
+ms-azuretools.vscode-containers     # Container Tools
+timonwong.shellcheck                # ShellCheck

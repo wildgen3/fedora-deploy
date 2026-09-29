@@ -1,0 +1,22 @@
+# Opt-in extras: only with  postinstall.py --with NAME  (see --list-options).
+
+[sched_ext schedulers | opt:scx]
+scx-scheds          # sched_ext CPU schedulers (scx_lavd, scx_bpfland, ...) on the stock kernel
+scx-tools           # scx_loader and scxctl: start and switch schedulers
+scx-manager         # simple GUI for picking a scheduler
+
+[latency test | opt:rt-tests]
+rt-tests            # cyclictest: scheduling latency, to compare schedulers
+
+[disk benchmark | opt:fio]
+fio                 # disk I/O benchmark, to compare I/O schedulers
+
+[Intel thermal daemon | opt:thermald]
+thermald            # manages heat before hardware throttling
+
+[AMD power limits | opt:ryzenadj]
+ryzenadj?           # AMD laptop/APU power limits (may not be packaged)
+
+[zenpower | opt:zenpower]
+zenpower3?          # Ryzen temperature/power/voltage driver (third-party COPR)
+zenmonitor3?        # GUI for zenpower3 readings (third-party COPR)

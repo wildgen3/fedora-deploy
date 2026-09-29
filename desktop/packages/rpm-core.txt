@@ -1,0 +1,38 @@
+# Core: installed first, before any other repo or package, because the rest
+# of the setup uses them. Format: see README.md in this folder.
+
+[package tools]
+dnf5-plugins        # `dnf copr` and `dnf config-manager`, used to add repos
+
+[version control]
+git                 # version control
+git-lfs             # large files in git (Hugging Face models and datasets)
+gh                  # GitHub CLI: PRs, issues, and git sign-in
+
+[command-line tools]
+curl                # downloads from the command line
+jq                  # reads and filters JSON
+ripgrep             # fast text search (rg)
+fzf                 # fuzzy finder for files and shell history
+btop                # system monitor: CPU, memory, disks, network
+tmux                # split terminals and sessions that survive disconnects
+unzip               # extracts .zip files
+7zip                # 7-Zip archiver (7z)
+fastfetch           # system summary in the terminal
+
+[Python and Node]
+python3             # Python
+python3-pip         # Python package installer
+python3-devel       # headers for Python packages with C parts
+python3.13          # Python 3.13 for the agent SDK environment (newest all SDKs support)
+uv                  # fast Python package and environment manager
+nodejs              # Node.js, for the Gemini and Codex CLIs
+npm                 # Node package manager
+
+[build tools]
+gcc                 # C compiler, for packages that build native code
+gcc-c++             # C++ compiler
+make                # build tool
+
+[containers]
+podman              # containers (Docker-compatible); ramalama uses it

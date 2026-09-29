@@ -1,0 +1,5 @@
+# Python command-line tools, each in its own environment (uv tool install).
+# Format:  package   command-it-provides   # what it's for
+
+[tools]
+huggingface_hub         hf          # Hugging Face CLI (hf auth login, downloads)

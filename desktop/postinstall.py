@@ -2,11 +2,14 @@
 """postinstall.py - personal software, tooling and performance tweaks for a
 Fedora KDE Plasma desktop or laptop.
 
-Download it, then run it as your normal user, never as root:
+Start it with the bootstrap (installs git, fetches this folder, runs this
+script as your normal user, never as root):
 
-    curl -fsSLO https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop/postinstall.py
-    python3 postinstall.py              # run (or continue) the setup
-    python3 postinstall.py --dry-run    # only print what would change
+    curl -fsSL https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop/bootstrap.sh | bash
+    curl -fsSL .../desktop/bootstrap.sh | bash -s -- --dry-run   # only print what would change
+
+Or from a clone: python3 desktop/postinstall.py. The package lists are the
+.txt files in desktop/packages/ (format: see the README there).
 
 Every run starts by detecting the hardware (CPU and GPU maker, laptop or
 desktop, Framework board) and only applies what matches. A machine can match
@@ -81,7 +84,6 @@ OPTIONS = {
     "rt-tests": ("cyclictest: scheduling latency, to compare schedulers", None),
     "fio": ("disk I/O benchmark, to compare I/O schedulers", None),
     "tuned-switcher": ("TuneD Switcher: pick any tuned profile, beyond KDE's three", None),
-    "full-ffmpeg": ("swap Fedora's ffmpeg-free for RPM Fusion's full ffmpeg (replaces a Fedora package)", None),
     "thermald": ("Intel's thermal daemon; test per machine, some laptops run better without it", "intel-cpu"),
     "ryzenadj": ("power-limit tuning for AMD laptop/APU chips", "amd-cpu"),
     "zenpower": ("zenpower3 + zenmonitor3: Ryzen power/voltage readings (third-party COPR, "
@@ -155,157 +157,21 @@ RPMFUSION = [
     "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{rel}.noarch.rpm",
 ]
 
-# ---- RPM packages: the editable package list. One line per package with what
-# it's for. Groups install together, so a problem in one doesn't block the
-# others. Tag: None = every machine; a hardware block ("amd-gpu", "laptop",
-# ...); or "opt:NAME" = only with --with NAME.
-RPM_GROUPS = [
-    ("command-line basics", None, [
-        ("git", "version control"),
-        ("gh", "GitHub CLI: PRs, issues, and git sign-in"),
-        ("curl", "downloads from the command line"),
-        ("jq", "reads and filters JSON"),
-        ("ripgrep", "fast text search (rg)"),
-        ("fzf", "fuzzy finder for files and shell history"),
-        ("btop", "system monitor: CPU, memory, disks, network"),
-        ("tmux", "split terminals and sessions that survive disconnects"),
-        ("unzip", "extracts .zip files"),
-        ("7zip", "7-Zip archiver (7z)"),
-        ("fastfetch", "system summary in the terminal"),
-    ]),
-    ("Python and Node", None, [
-        ("python3", "Python"),
-        ("python3-pip", "Python package installer"),
-        ("python3-devel", "headers for Python packages with C parts"),
-        ("python3.13", "Python 3.13 for the agent SDK environment (newest all SDKs support)"),
-        ("uv", "fast Python package and environment manager"),
-        ("nodejs", "Node.js, for the Gemini and Codex CLIs"),
-        ("npm", "Node package manager"),
-        ("gcc", "C compiler, for packages that build native code"),
-        ("gcc-c++", "C++ compiler"),
-        ("make", "build tool"),
-    ]),
-    ("containers", None, [
-        ("podman", "containers (Docker-compatible); ramalama uses it"),
-    ]),
-    ("local AI", None, [
-        ("ollama", "runs local language models (uses ROCm on AMD GPUs)"),
-        ("ramalama", "runs local models in containers"),
-        ("llama-cpp", "llama.cpp command-line tools"),
-    ]),
-    ("remote desktop", None, [
-        ("remmina", "remote desktop client"),
-        ("remmina-plugins-rdp", "RDP: Windows, and KDE's KRDP"),
-        ("remmina-plugins-vnc", "VNC"),
-        ("remmina-plugins-secret", "saves passwords in KWallet (Secret Service)"),
-        ("remmina-plugins-kwallet", "direct KWallet plugin (optional: not in every release)"),
-    ]),
-    ("virtual machines", None, [
-        ("@virtualization", "QEMU/KVM, libvirt and virt-manager"),
-        ("swtpm", "virtual TPM chip (Windows 11 needs one)"),
-        ("swtpm-tools", "swtpm setup tools"),
-        ("edk2-ovmf", "UEFI firmware for VMs"),
-    ]),
-    ("Google Drive mount", None, [
-        ("rclone", "mounts Google Drive at ~/GoogleDrive"),
-        ("fuse3", "lets rclone mount it as a normal folder"),
-    ]),
-    ("gaming", None, [
-        ("steam-devices", "udev rules so controllers and the Steam Deck work"),
-        ("gamemode", "Feral GameMode: performance governor (and AMD GPU clocks) while a game runs; "
-                     "per game: gamemoderun %command%"),
-        ("mangohud", "in-game overlay: FPS, frame times, temperatures, clocks; logs to CSV"),
-        ("gamescope", "Valve's micro-compositor: scaling, frame limits, HDR, fullscreen fixes"),
-    ]),
-    ("process priority", None, [
-        ("ananicy-cpp", "sets process priority from rules: games up, compilers/indexers/backups down"),
-        ("cachyos-ananicy-rules", "CachyOS's rules database, used as-is (your overrides: /etc/ananicy.d/99-custom/)"),
-    ]),
-    ("power", None, [
-        ("tuned", "Fedora's power/performance profile daemon"),
-        ("tuned-ppd", "lets KDE's power menu (Power Saver / Balanced / Performance) drive tuned"),
-    ]),
-    ("monitoring", None, [
-        ("lm_sensors", "CPU/board temperatures and fan speeds (feeds MangoHud and KDE widgets)"),
-        ("powertop", "what draws power and what wakes the system; --csv output"),
-        ("vulkan-tools", "vulkaninfo and friends, for diagnosing Vulkan"),
-        ("libva-utils", "vainfo: checks hardware video decode/encode"),
-    ]),
-    ("benchmarking", None, [
-        ("phoronix-test-suite", "repeatable, unattended benchmarks; results kept local (upload off)"),
-        ("vkmark", "Vulkan GPU benchmark"),
-        ("glmark2", "OpenGL GPU benchmark"),
-        ("stress-ng", "CPU/memory/cache stress: stability and thermal soak after tuning"),
-        ("sysbench", "quick CPU and memory throughput benchmarks"),
-        ("kernel-tools", "turbostat (per-core clocks, C-states, package power) and cpupower"),
-        ("s-tui", "terminal UI: stress test with live frequency/temperature/power graphs"),
-    ]),
-    ("codecs (RPM Fusion)", None, [
-        ("gstreamer1-plugins-bad-freeworld", "GStreamer codecs Fedora can't ship"),
-        ("gstreamer1-plugins-ugly", "more GStreamer codecs"),
-        ("gstreamer1-plugin-libav", "GStreamer's FFmpeg-based codecs"),
-    ]),
-    # Google Chrome, VS Code, ... from the vendors' repos.
-    ("Google Chrome", None, [("google-chrome-stable", "Chrome browser (Google's repo)")]),
-    ("VS Code", None, [("code", "Visual Studio Code (Microsoft's repo)")]),
-    ("ChatGPT", None, [("chatgpt", "ChatGPT desktop, with Codex (OpenAI's repo)")]),
-    ("Google Cloud CLI", None, [
-        ("google-cloud-cli", "gcloud"),
-        ("google-cloud-cli-gke-gcloud-auth-plugin", "sign-in plugin for GKE clusters"),
-        ("kubectl", "Kubernetes CLI"),
-        ("google-cloud-cli-skaffold", "build/deploy loop for Kubernetes apps"),
-    ]),
-    ("Tailscale", None, [("tailscale", "private network between your machines (Tailscale's repo)")]),
-    ("Sunshine", None, [("Sunshine", "streams this PC to Moonlight (e.g. the Steam Deck)")]),
-    ("virtio-win drivers", None, [("virtio-win", "Windows VM drivers ISO")]),
-    # ---- hardware blocks
-    ("AMD GPU", "amd-gpu", [
-        ("lact", "AMD GPU control: clocks, undervolt, power limit, fan curves (+ lactd daemon)"),
-        ("rocm-hip", "ROCm runtime: ollama and other apps compute on the AMD GPU"),
-        ("rocm-opencl", "OpenCL on ROCm"),
-        ("rocminfo", "shows what ROCm sees"),
-    ]),
-    ("Intel GPU", "intel-gpu", [
-        ("igt-gpu-tools", "intel_gpu_top: live Intel GPU usage"),
-    ]),
-    ("hibernation", "hibernate", [
-        ("policycoreutils-python-utils", "semanage, to label the hibernation swap file for SELinux"),
-        ("mokutil", "reads the Secure Boot state"),
-    ]),
-    ("Framework AMD", "framework-amd", [
-        ("amd-debug-tools", "amd_s2idle: AMD sleep diagnostics (optional: not in every release)"),
-    ]),
-    # ---- opt-in extras
-    ("sched_ext schedulers", "opt:scx", [
-        ("scx-scheds", "sched_ext CPU schedulers (scx_lavd, scx_bpfland, ...) on the stock kernel"),
-        ("scx-tools", "scx_loader and scxctl: start and switch schedulers"),
-        ("scx-manager", "simple GUI for picking a scheduler"),
-    ]),
-    ("latency test", "opt:rt-tests", [("rt-tests", "cyclictest: scheduling latency")]),
-    ("disk benchmark", "opt:fio", [("fio", "disk I/O benchmark")]),
-    ("Intel thermal daemon", "opt:thermald", [("thermald", "manages heat before hardware throttling")]),
-    ("AMD power limits", "opt:ryzenadj", [("ryzenadj", "AMD laptop/APU power limits (optional: may not be packaged)")]),
-    ("zenpower", "opt:zenpower", [
-        ("zenpower3", "Ryzen temperature/power/voltage driver (optional: third-party COPR)"),
-        ("zenmonitor3", "GUI for zenpower3 readings (optional: third-party COPR)"),
-    ]),
-]
-
-# Skipped quietly if this Fedora release doesn't have them.
-OPTIONAL_RPMS = {"remmina-plugins-kwallet", "mesa-vdpau-drivers-freeworld", "amd-debug-tools",
-                 "ryzenadj", "zenpower3", "zenmonitor3"}
-
-# Sanctioned codec swaps (Fedora package -> RPM Fusion build of the same thing).
-# Fedora strips patented video codecs; these put them back. (from, to, tag, what)
-SWAPS = [
-    ("mesa-va-drivers", "mesa-va-drivers-freeworld", "amd-gpu",
-     "AMD hardware H.264/H.265 video decode/encode (Sunshine, OBS, browsers)"),
-    ("mesa-vdpau-drivers", "mesa-vdpau-drivers-freeworld", "amd-gpu",
-     "the same for the VDPAU video API some players use"),
-    ("libva-intel-media-driver", "intel-media-driver", "intel-gpu",
-     "Intel hardware video decode/encode, full codec set"),
-    ("ffmpeg-free", "ffmpeg", "opt:full-ffmpeg", "FFmpeg with every codec"),
-]
+# ---- package lists: read from desktop/packages/*.txt (see the README there).
+# Each file loads on its own; a bad line is reported and skipped.
+LIST_DIR = Path(__file__).resolve().parent / "packages"
+RPM_CORE_FILE = "rpm-core.txt"       # installed first, before any other repo
+# Filled in by load_lists():
+RPM_GROUPS = []         # [(group, tag, [(package, what)], file)]
+OPTIONAL_RPMS = set()   # names marked with "?": fine if missing
+SWAPS = []              # [(fedora_package, replacement, tag, what)]
+FLATPAKS = []           # [(app_id, what, tag)]
+VSCODE_EXTENSIONS = {}  # id -> what
+NPM_GLOBALS = {}        # package -> command
+UV_TOOLS = {}           # package -> command
+AGENT_SDKS = []         # pip packages
+AGENT_IMPORTS = []      # import names checked by the validation pass
+LIST_ERRORS = []        # problems found while reading the lists
 
 # ---- Antigravity (Google)
 
@@ -339,31 +205,12 @@ ANTIGRAVITY = {
                     "2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz"},
 }
 
-# ---- Flatpaks (Flathub, installed for your user only). (id, what, tag)
-FLATPAKS = [
-    ("com.discordapp.Discord", "Discord", None),
-    ("com.spotify.Client", "Spotify", None),
-    ("md.obsidian.Obsidian", "Obsidian: notes", None),
-    ("com.orcaslicer.OrcaSlicer", "OrcaSlicer: filament 3D printers", None),
-    ("io.mango3d.LycheeSlicer", "Lychee Slicer: resin 3D printers", None),
-    ("com.valvesoftware.Steam", "Steam (Remote Play included)", None),
-    ("com.vysp3r.ProtonPlus", "ProtonPlus: installs Proton-GE / Proton-CachyOS builds", None),
-    ("com.obsproject.Studio", "OBS Studio: recording and streaming", None),
-    ("com.obsproject.Studio.Plugin.OBSVkCapture", "OBS game capture plugin", None),
-    ("com.moonlight_stream.Moonlight", "Moonlight: game streaming client", None),
-    ("com.heroicgameslauncher.hgl", "Heroic: Epic, GOG and Amazon games", "opt:heroic"),
-    ("net.lutris.Lutris", "Lutris: other stores and emulators", "opt:lutris"),
-    ("org.easycoding.TunedSwitcher", "TuneD Switcher: any tuned profile", "opt:tuned-switcher"),
-]
-
-# Extensions Steam games can use. Installed at the branch that matches Steam's
-# runtime, which is read from Steam once it's installed.
-STEAM_EXTENSIONS = {
-    "org.freedesktop.Platform.VulkanLayer.MangoHud": "MangoHud (FPS overlay, logging)",
-    "org.freedesktop.Platform.VulkanLayer.gamescope": "gamescope",
-    "org.freedesktop.Platform.VulkanLayer.vkBasalt": "vkBasalt (post-processing)",
-    "org.freedesktop.Platform.VulkanLayer.OBSVkCapture": "OBS game capture layer",
-}
+# Steam used to be a Flatpak here; a leftover one is removed in stage 2.
+OLD_STEAM_FLATPAK = "com.valvesoftware.Steam"
+OLD_STEAM_LAYERS = ["org.freedesktop.Platform.VulkanLayer.MangoHud",
+                    "org.freedesktop.Platform.VulkanLayer.gamescope",
+                    "org.freedesktop.Platform.VulkanLayer.vkBasalt",
+                    "org.freedesktop.Platform.VulkanLayer.OBSVkCapture"]
 
 FLATHUB_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
 
@@ -371,41 +218,14 @@ FLATHUB_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
 
 # npm installs "global" packages into ~/.local (so ~/.local/bin), not /usr.
 NPM_PREFIX = HOME / ".local"
-NPM_GLOBALS = {"@google/gemini-cli": "gemini", "@openai/codex": "codex"}
 
 CLAUDE_INSTALLER = "https://claude.ai/install.sh"
 
-UV_TOOLS = {"huggingface_hub": "hf"}
 
 # Shared scratch environment for agent SDK experiments; real projects pin
 # their own copies. `agents` in a terminal activates it.
 AGENTS_VENV = HOME / ".venvs" / "agents"
 AGENTS_PYTHON = "3.13"
-AGENT_SDKS = ["anthropic", "claude-agent-sdk", "google-genai", "google-adk", "openai",
-              "openai-agents", "mcp", "litellm", "python-dotenv", "ipykernel"]
-# Import names checked by the validation pass.
-AGENT_IMPORTS = ["anthropic", "claude_agent_sdk", "google.genai", "google.adk", "openai",
-                 "agents", "mcp", "litellm", "dotenv", "ipykernel"]
-
-VSCODE_EXTENSIONS = {
-    "ms-vscode-remote.remote-ssh": "Remote - SSH",
-    "anthropic.claude-code": "Claude Code",
-    "google.geminicodeassist": "Gemini Code Assist",
-    "saoudrizwan.claude-dev": "Cline",
-    "openai.chatgpt": "Codex (OpenAI)",
-    "ms-python.python": "Python",
-    "ms-python.vscode-pylance": "Pylance",
-    "charliermarsh.ruff": "Ruff",
-    "ms-toolsai.jupyter": "Jupyter",
-    "googlecloudtools.cloudcode": "Cloud Code",
-    "github.vscode-pull-request-github": "GitHub Pull Requests",
-    "redhat.vscode-yaml": "YAML",
-    "tamasfe.even-better-toml": "Even Better TOML",
-    "usernamehw.errorlens": "Error Lens",
-    "ms-azuretools.vscode-containers": "Container Tools",
-    "timonwong.shellcheck": "ShellCheck",
-}
-
 # API keys for the SDKs. Kept in a private file and loaded only by `agents`,
 # never globally: a global ANTHROPIC_API_KEY (or GEMINI_/OPENAI_) makes the
 # Claude/Gemini/Codex CLIs bill that key instead of your subscription.
@@ -678,7 +498,7 @@ SIGNIN_APPS = [
      "Sign in to your OpenAI account. Codex is in the app's sidebar (Linux preview)."),
     ("Discord", ["com.discordapp.Discord"], "Sign in."),
     ("Spotify", ["com.spotify.Client"], "Sign in."),
-    ("Steam", ["com.valvesoftware.Steam"],
+    ("Steam", ["steam"],
      "Sign in. Settings > Compatibility: turn on Steam Play for all titles. "
      "Settings > Remote Play: turn it on."),
     ("Obsidian", ["md.obsidian.Obsidian"], "Open or create a vault; sign in if you use Sync."),
@@ -760,10 +580,23 @@ def warn(msg):
     say(f"WARNING: {msg}")
 
 
-def failed(what):
-    """Record a non-fatal failure; the script keeps going."""
-    FAILURES.append(what)
-    say(f"FAILED: {what}")
+def failed(what, detail=None):
+    """Record a non-fatal failure; the script keeps going. All of them are
+    listed at the end with the reason: `detail`, or by default the error text
+    of the command that just failed (dnf's, npm's, ...)."""
+    if detail is None:
+        detail = FACTS.pop("last_error", "")
+    FAILURES.append((what, detail.strip()))
+    say(f"   FAILED: {what}")
+    for line in detail.strip().splitlines()[:6]:
+        say(f"      {line}")
+
+
+def error_text(result, lines=8):
+    """The most useful lines of a failed command's output."""
+    out = (result.stdout + "\n" + result.stderr).strip().splitlines()
+    keep = [l for l in out if re.search(r"error|fail|no match|not found|conflict|problem|nothing provides", l, re.I)]
+    return "\n".join((keep or out)[-lines:])
 
 
 def skipped(what):
@@ -840,6 +673,8 @@ def run(cmd, changes_system=True, input_text=None, env=None):
     if result.stderr.strip():
         log(result.stderr.rstrip())
     log(f"(exit code {result.returncode})")
+    if changes_system:
+        FACTS["last_error"] = error_text(result) if result.returncode != 0 else ""
     if result.returncode != 0 and changes_system:
         say(f"   command failed: {shown}")
         tail = (result.stdout + result.stderr).strip().splitlines()[-12:]
@@ -897,6 +732,93 @@ def read_sys(path):
         return Path(path).read_text(errors="replace").strip()
     except OSError:
         return ""
+
+
+# ================================================================ package lists
+
+NAME_OK = re.compile(r"^[@A-Za-z0-9._+:/-]+$")
+KNOWN_BLOCKS = {"amd-cpu", "intel-cpu", "amd-gpu", "intel-gpu", "laptop", "desktop", "framework",
+                "framework-intel", "framework-amd", "hibernate", "amd-gpu-tuning"}
+
+
+def read_list(filename, fields):
+    """Parse one list file. Returns [(group, tag, values, what, optional)].
+    A bad line or header is recorded in LIST_ERRORS (file:line) and skipped;
+    the rest of the file still loads."""
+    path = LIST_DIR / filename
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as err:
+        LIST_ERRORS.append(f"{filename}: can't read it ({err.strerror})")
+        return []
+    entries, group, tag, bad_group = [], filename, None, False
+    for n, raw in enumerate(lines, 1):
+        body, _, what = raw.partition("#")
+        body, what = body.strip(), what.strip()
+        if not body:
+            continue
+        where = f"{filename}:{n}"
+        if body.startswith("["):
+            m = re.fullmatch(r"\[\s*([^\]|]+?)\s*(?:\|\s*([^\]]*?)\s*)?\]", body)
+            tag = (m.group(2) or None) if m else None
+            if not m:
+                LIST_ERRORS.append(f"{where}: can't read this group header: {raw.strip()}")
+                bad_group = True
+            elif tag and tag not in KNOWN_BLOCKS and not (tag.startswith("opt:") and tag[4:] in OPTIONS):
+                LIST_ERRORS.append(f"{where}: unknown block or option '{tag}' (group skipped)")
+                bad_group = True
+            else:
+                group, bad_group = m.group(1), False
+            continue
+        if bad_group:
+            continue
+        values = body.split()
+        optional = any(v.endswith("?") for v in values)
+        values = [v.rstrip("?") for v in values]
+        if len(values) != fields:
+            LIST_ERRORS.append(f"{where}: expected {fields} value(s), found {len(values)}: {raw.strip()}")
+            continue
+        if not all(NAME_OK.match(v) for v in values):
+            LIST_ERRORS.append(f"{where}: unexpected characters: {raw.strip()}")
+            continue
+        entries.append((group, tag, values, what, optional))
+    return entries
+
+
+def load_lists():
+    """Read every list in desktop/packages/ into the globals above."""
+    if not LIST_DIR.is_dir():
+        fatal(f"the package lists aren't next to this script ({LIST_DIR}).\n"
+              "Get the whole folder with the bootstrap:\n"
+              "  curl -fsSL https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop/bootstrap.sh | bash")
+    rpm_files = [RPM_CORE_FILE] + sorted(f.name for f in LIST_DIR.glob("rpm-*.txt") if f.name != RPM_CORE_FILE)
+    for filename in rpm_files:
+        groups = {}
+        for group, tag, (name,), what, optional in read_list(filename, 1):
+            groups.setdefault((group, tag), []).append((name, what))
+            if optional:
+                OPTIONAL_RPMS.add(name)
+        RPM_GROUPS.extend((g, t, pkgs, filename) for (g, t), pkgs in groups.items())
+    for _, tag, (old, new), what, optional in read_list("swaps.txt", 2):
+        SWAPS.append((old, new, tag, what))
+        if optional:
+            OPTIONAL_RPMS.update((old, new))
+    for _, tag, (app,), what, _ in read_list("flatpak.txt", 1):
+        FLATPAKS.append((app, what or app, tag))
+    for _, _, (ext,), what, _ in read_list("vscode.txt", 1):
+        VSCODE_EXTENSIONS[ext] = what or ext
+    for _, _, (pkg, cmd), _, _ in read_list("npm.txt", 2):
+        NPM_GLOBALS[pkg] = cmd
+    for _, _, (pkg, cmd), _, _ in read_list("uv-tools.txt", 2):
+        UV_TOOLS[pkg] = cmd
+    for _, _, (pkg, mod), _, _ in read_list("agent-sdks.txt", 2):
+        AGENT_SDKS.append(pkg)
+        AGENT_IMPORTS.append(mod)
+    count = sum(len(p) for _, _, p, _ in RPM_GROUPS) + len(SWAPS) + len(FLATPAKS) + \
+        len(VSCODE_EXTENSIONS) + len(NPM_GLOBALS) + len(UV_TOOLS) + len(AGENT_SDKS)
+    say(f"Package lists: {count} entries from {LIST_DIR}")
+    for err in LIST_ERRORS:
+        say(f"   LIST PROBLEM {err}")
 
 
 # ================================================================ startup checks
@@ -1126,12 +1048,16 @@ def save_options(opts):
 
 
 def install_copy():
-    """Copy this script to a fixed place for the after-reboot autostart."""
+    """Copy this script and its package lists to a fixed place for the
+    after-reboot autostart."""
     me = Path(__file__).resolve()
     if me == INSTALLED_COPY.resolve() or DRY_RUN:
         return
     INSTALLED_COPY.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(me, INSTALLED_COPY)
+    lists = INSTALLED_COPY.parent / "packages"
+    shutil.rmtree(lists, ignore_errors=True)  # so lists removed upstream go too
+    shutil.copytree(LIST_DIR, lists)
 
 
 def set_autostart(on):
@@ -1168,6 +1094,9 @@ def ask_reboot(what_next):
 
 # ================================================================ package helpers
 
+ARCH = re.compile(r"\.(i686|x86_64|noarch)$")
+
+
 def package_available(name):
     """True if dnf can find this package (installed or in an enabled repo).
 
@@ -1187,6 +1116,8 @@ def rpm_installed(name):
     if name.startswith("@"):
         # Group installs are recorded by dnf; check the group's key packages.
         return name == "@virtualization" and succeeds(["rpm", "-q", "virt-manager", "qemu-kvm"])
+    if ARCH.search(name):
+        return succeeds(["rpm", "-q", name])  # e.g. mesa-va-drivers.i686
     return succeeds(["rpm", "-q", "--whatprovides", name])
 
 
@@ -1205,16 +1136,18 @@ def install_packages(names, label):
         elif name in OPTIONAL_RPMS:
             skipped(f"{name}: not in this Fedora release's repositories")
         else:
-            failed(f"{name}: not found in the enabled repositories")
+            failed(f"{name} ({label}): not found in any enabled repository",
+                   "Check the spelling in the package list, or that its repo was added.")
     if not wanted_names:
         return
     say(f"   {label}: installing {', '.join(wanted_names)}")
     if run(["sudo", "dnf", "install", "-y", *wanted_names]).returncode == 0:
         return
-    warn(f"installing '{label}' failed; retrying one package at a time")
+    warn(f"installing '{label}' as a group failed; retrying one package at a time")
     for name in wanted_names:
-        if run(["sudo", "dnf", "install", "-y", name]).returncode != 0:
-            failed(f"install {name}")
+        r = run(["sudo", "dnf", "install", "-y", name])
+        if r.returncode != 0:
+            failed(f"install {name} ({label})", error_text(r))
 
 
 def swap_package(old, new, what):
@@ -1226,15 +1159,17 @@ def swap_package(old, new, what):
         if new in OPTIONAL_RPMS:
             skipped(f"{new}: not in this Fedora release's repositories")
         else:
-            failed(f"{new}: not found in the enabled repositories")
+            failed(f"{new}: not found in any enabled repository",
+                   "Check swaps.txt, or that RPM Fusion is enabled.")
         return
     say(f"   {new}: {what}")
     if rpm_installed(old):
         cmd = ["sudo", "dnf", "swap", "-y", old, new, "--allowerasing"]
     else:
         cmd = ["sudo", "dnf", "install", "-y", new]
-    if run(cmd).returncode != 0:
-        failed(f"swap {old} -> {new}")
+    r = run(cmd)
+    if r.returncode != 0:
+        failed(f"swap {old} -> {new}", error_text(r))
 
 
 def write_root_file(path, content, mode="644"):
@@ -1443,11 +1378,12 @@ def flatpak_updates():
 
 def stage2_install():
     run_tasks("Stage 2 of 4: install (Phase A)", [
+        ("Core tools: git, CLI and code tools", install_core),
         ("Repositories", setup_repos),
-        ("Video codecs for this GPU (RPM Fusion)", install_swaps),
+        ("Codecs for this machine (RPM Fusion)", install_swaps),
         ("Packages", install_rpms),
+        ("Old Flatpak Steam cleanup", cleanup_flatpak_steam),
         ("Flatpak apps", install_flatpaks),
-        ("Steam extensions", install_steam_extensions),
         ("AI command-line tools", install_cli_tools),
         ("Agent SDK environment", install_agent_sdks),
         ("Shell setup", install_shell_config),
@@ -1465,9 +1401,6 @@ def stage2_install():
 
 def setup_repos():
     rel = FACTS.get("version") or output_of(["rpm", "-E", "%fedora"])
-    # `dnf copr` and `dnf config-manager` are dnf5 plugins.
-    install_packages(["dnf5-plugins"], "dnf plugins")
-
     section("RPM Fusion (free + nonfree)")
     if succeeds(["rpm", "-q", "rpmfusion-free-release", "rpmfusion-nonfree-release"]):
         say("   already enabled")
@@ -1528,14 +1461,51 @@ def install_swaps():
         swap_package(old, new, what)
 
 
-def rpm_groups():
-    """(label, [names]) for every package group that applies to this machine."""
-    return [(label, [name for name, _ in pkgs]) for label, tag, pkgs in RPM_GROUPS if wanted(tag)]
+def rpm_groups(core):
+    """(label, [names]) for each package group that applies to this machine:
+    the core file's groups, or all the others."""
+    return [(label, [name for name, _ in pkgs]) for label, tag, pkgs, file in RPM_GROUPS
+            if wanted(tag) and (file == RPM_CORE_FILE) == core]
+
+
+def install_core():
+    """git, the CLI and code tools, from Fedora: the rest of the setup uses them."""
+    for label, names in rpm_groups(core=True):
+        install_packages(names, label)
 
 
 def install_rpms():
-    for label, names in rpm_groups():
+    for label, names in rpm_groups(core=False):
         install_packages(names, label)
+
+
+def flatpak_refs(app_ids):
+    """Installed user refs (app/runtime/branch) for these IDs."""
+    refs = output_of(["flatpak", "list", "--user", "--all", "--columns=ref"]).split()
+    return [r for r in refs if r.split("/")[1 if r.count("/") >= 3 else 0] in app_ids]
+
+
+def cleanup_flatpak_steam():
+    """Steam is now RPM Fusion's package. If the Flatpak Steam from an earlier
+    run is here, remove it, its Vulkan layers and its sandbox permission, then
+    the runtimes nothing uses any more (Flatpak's own 32-bit GL and i386
+    compatibility libraries). Your Flatpak Steam data (~/.var/app/...) stays."""
+    refs = flatpak_refs([OLD_STEAM_FLATPAK, *OLD_STEAM_LAYERS])
+    if not refs:
+        say("   No Flatpak Steam here; nothing to clean up.")
+        return
+    say(f"   Removing {len(refs)} Flatpak Steam item(s): {', '.join(r.split('/')[1] for r in refs)}")
+    r = run(["flatpak", "uninstall", "--user", "-y", "--noninteractive", *refs])
+    if r.returncode != 0:
+        failed("remove the Flatpak Steam", error_text(r))
+        return
+    run(["flatpak", "override", "--user", "--reset", OLD_STEAM_FLATPAK])
+    say("   Removing Flatpak runtimes nothing uses any more (incl. its 32-bit libraries)")
+    run(["flatpak", "uninstall", "--user", "-y", "--noninteractive", "--unused"])
+    old_data = HOME / ".var/app" / OLD_STEAM_FLATPAK
+    if old_data.exists():
+        NOTES.append(f"The Flatpak Steam's games and settings are still in {old_data}. In Steam: "
+                     "Settings > Storage > Add Drive to reuse its steamapps folder, or delete it.")
 
 
 def flatpak_installed(app_id, branch=None):
@@ -1555,33 +1525,9 @@ def install_flatpaks():
         return
     warn("the batch install failed; retrying one app at a time")
     for app, _ in missing:
-        if run(cmd + [app]).returncode != 0:
-            failed(f"flatpak {app}")
-
-
-def steam_branch():
-    """Steam's runtime branch (e.g. 24.08), read from `flatpak info`."""
-    info = output_of(["flatpak", "info", "--user", "com.valvesoftware.Steam"])
-    m = re.search(r"^\s*Runtime:\s*\S+/(\S+)\s*$", info, re.M)
-    return m.group(1) if m else ""
-
-
-def install_steam_extensions():
-    branch = steam_branch()
-    if not branch:
-        if DRY_RUN:
-            say("   (dry run: Steam isn't installed yet; a real run reads its runtime branch here)")
-        else:
-            failed("Steam extensions: Steam isn't installed, so its runtime branch is unknown")
-        return
-    for ext, label in STEAM_EXTENSIONS.items():
-        if flatpak_installed(ext, branch):
-            say(f"   {label}: already installed")
-            continue
-        say(f"   {label}")
-        if run(["flatpak", "install", "--user", "-y", "--noninteractive", "flathub",
-                f"{ext}//{branch}"]).returncode != 0:
-            failed(f"flatpak {ext}//{branch}")
+        r = run(cmd + [app])
+        if r.returncode != 0:
+            failed(f"flatpak {app}", error_text(r))
 
 
 def tool_env():
@@ -2325,7 +2271,7 @@ def collect_checks(post_reboot):
     """Every item stage 2 installs, as (area, item, ok). Read-only.
     post_reboot adds checks that only pass once the reboot made them live."""
     rows = []
-    for label, tag, pkgs in RPM_GROUPS:
+    for label, tag, pkgs, _ in RPM_GROUPS:
         if not wanted(tag):
             continue
         for name, _ in pkgs:
@@ -2339,9 +2285,7 @@ def collect_checks(post_reboot):
     for app, what, tag in FLATPAKS:
         if wanted(tag):
             rows.append(("flatpak", what.split(":")[0], flatpak_installed(app)))
-    branch = steam_branch()
-    for ext, label in STEAM_EXTENSIONS.items():
-        rows.append(("steam-ext", label, bool(branch) and flatpak_installed(ext, branch)))
+    rows.append(("cleanup", "no leftover Flatpak Steam", not flatpak_refs([OLD_STEAM_FLATPAK])))
 
     env = tool_env()
     for cmd in ["claude", *NPM_GLOBALS.values(), *UV_TOOLS.values(), "gcloud", "code", "uv", "node"]:
@@ -2435,10 +2379,10 @@ def verify_checks():
 
 # What to re-run when an area has failures.
 RETRY = {
-    "rpm": install_rpms,
+    "rpm": lambda: (install_core(), install_rpms()),
     "codecs": install_swaps,
     "flatpak": install_flatpaks,
-    "steam-ext": install_steam_extensions,
+    "cleanup": cleanup_flatpak_steam,
     "cli": install_cli_tools,
     "sdk": install_agent_sdks,
     "vscode": install_vscode_extensions,
@@ -2581,9 +2525,6 @@ toggle_logging=Shift_L+F2
 """)
     if not DRY_RUN:
         logs.mkdir(parents=True, exist_ok=True)
-    # Flatpak Steam's MangoHud can only write where the sandbox allows.
-    if flatpak_installed("com.valvesoftware.Steam"):
-        run(["flatpak", "override", "--user", f"--filesystem={BENCH_ROOT}", "com.valvesoftware.Steam"])
     say(f"   Logs go to {logs}")
 
 
@@ -2918,12 +2859,24 @@ def summary():
     banner("Summary")
     for item in SKIPPED:
         say(f"- Skipped: {item}")
-    for item in FAILURES:
-        say(f"- Failed: {item}")
-    if not FAILURES:
-        say("- Failed: nothing")
     for note in NOTES:
         say(f"- Note: {note}")
+    problems = [(f"package list: {e}", "") for e in LIST_ERRORS] + FAILURES
+    if not problems:
+        say("- Problems: none")
+    else:
+        say(f"- Problems ({len(problems)}):")
+        report = [f"Problems from {SCRIPT}, {STAMP}", ""]
+        for what, detail in problems:
+            say(f"  * {what}")
+            report.append(f"* {what}")
+            for line in detail.splitlines():
+                say(f"      {line}")
+                report.append(f"    {line}")
+        report += ["", f"Full log: {LOG_FILE}"]
+        problems_file = LOG_DIR / f"problems-{STAMP}.txt"
+        problems_file.write_text("\n".join(report) + "\n")
+        say(f"- Problems saved to {problems_file}")
     say(f"- Full log: {LOG_FILE}")
 
 
@@ -2985,6 +2938,7 @@ def main():
     os.environ["PATH"] = f"{LOCAL_BIN}:{os.environ.get('PATH', '')}"
 
     check_fedora()
+    load_lists()
     detect_hardware()
     if args.check:
         banner("Checking everything (read-only)")
@@ -3008,6 +2962,7 @@ def main():
             start = args.stage or min(saved_stage(), 4)
             for n in range(start, 5 if not args.stage else start + 1):
                 (stage1_clean_base, stage2_install, stage3_configure, stage4_baseline)[n - 1]()
+            summary()
         else:
             # The autostart entry is only for the first login after a reboot.
             set_autostart(False)
