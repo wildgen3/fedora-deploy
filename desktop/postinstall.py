@@ -18,9 +18,9 @@ several blocks: AMD CPU, Intel CPU, AMD GPU, Intel GPU, laptop, Framework.
 It runs in stages. After each reboot a Konsole window opens on its own once you
 log in and carries on where it left off (or just run the same command again):
 
-  Stage 1  Clean base: safety checks, one sudo password prompt, full system
-           update, firmware updates (listed first, installed after you
-           confirm; laptops must be on the charger), Flatpak updates. Reboot.
+  Stage 1  Clean base: 24-hour time (system and KDE), full system update,
+           firmware updates (listed first, installed after you confirm;
+           laptops must be on the charger), Flatpak updates. Reboot.
   Stage 2  Install ("Phase A"): repos, packages, Flatpaks, AI CLIs and SDKs,
            VS Code extensions, Antigravity, Google Drive mount, performance
            tweaks (sysctl, I/O schedulers, noatime, ananicy-cpp, GameMode),
@@ -251,6 +251,15 @@ agents() {{
     fi
 }}
 """
+
+# ---- 24-hour time (stage 1, first step)
+
+# Locale used only for time/date formats (LC_TIME), system-wide and in KDE;
+# the language and everything else stay as installed.
+#   en_GB.UTF-8 -> 24-hour time, dates day-first (29/09/2026)
+#   en_DK.UTF-8 -> 24-hour time, ISO dates (2026-09-29)
+TIME_LOCALE = "en_GB.UTF-8"
+CLOCK_APPLETS_FILE = HOME / ".config" / "plasma-org.kde.plasma.desktop-appletsrc"
 
 # ---- performance tweaks (drop-in files: delete one to revert it)
 
@@ -1325,10 +1334,77 @@ def expected_kernel_args():
 
 def stage1_clean_base():
     run_tasks("Stage 1 of 4: clean base", [
+        ("24-hour time", set_24h_time),
         ("System update (dnf)", system_update),
         ("Firmware (fwupd)", firmware_updates),
         ("Flatpak updates", flatpak_updates),
     ])
+
+
+def norm_locale(name):
+    """'en_GB.UTF-8' and 'en_GB.utf8' are the same locale; compare them loosely."""
+    return name.lower().replace("-", "")
+
+
+def read_locale_conf():
+    """Current system locale settings from /etc/locale.conf (KEY=value lines)."""
+    values = {}
+    for line in read_sys("/etc/locale.conf").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and not key.startswith("#"):
+            values[key] = value.strip('"')
+    return values
+
+
+def find_clock_applets():
+    """Digital Clock widgets in the panel config, as group paths like
+    ['Containments', '2', 'Applets', '19']."""
+    found, group = [], None
+    for line in read_sys(CLOCK_APPLETS_FILE).splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            group = line[1:-1].split("][")
+        elif line == "plugin=org.kde.plasma.digitalclock" and group and len(group) == 4:
+            found.append(group)
+    return found
+
+
+def time_is_24h():
+    return (norm_locale(read_locale_conf().get("LC_TIME", "")) == norm_locale(TIME_LOCALE)
+            and norm_locale(kread("plasma-localerc", ["Formats"], "LC_TIME")) == norm_locale(TIME_LOCALE))
+
+
+def set_24h_time():
+    """24-hour time for the command line (system LC_TIME) and KDE (Region &
+    Language > Time format, and the panel clock). Only the time/date format
+    changes; the language stays."""
+    # The locale must exist first; English ones come from glibc-langpack-en.
+    if not any(norm_locale(l) == norm_locale(TIME_LOCALE) for l in output_of(["locale", "-a"]).split()):
+        install_packages([f"glibc-langpack-{TIME_LOCALE.split('_')[0]}"], "locale data")
+        if not DRY_RUN and not any(norm_locale(l) == norm_locale(TIME_LOCALE)
+                                   for l in output_of(["locale", "-a"]).split()):
+            failed(f"locale {TIME_LOCALE} isn't available, so 24-hour time wasn't set")
+            return
+
+    section(f"system time format: LC_TIME={TIME_LOCALE}")
+    current = read_locale_conf()
+    if norm_locale(current.get("LC_TIME", "")) == norm_locale(TIME_LOCALE):
+        say("   already set")
+    else:
+        # `localectl set-locale` replaces the whole setting, so pass the
+        # current values (LANG etc.) back in along with the new LC_TIME.
+        current["LC_TIME"] = TIME_LOCALE
+        run(["sudo", "localectl", "set-locale", *[f"{k}={v}" for k, v in current.items()]])
+
+    section("KDE: Region & Language > Time format")
+    if not kwrite("plasma-localerc", ["Formats"], "LC_TIME", TIME_LOCALE):
+        say("   already set")
+    # Panel clock: use24hFormat 0 = 12-hour, 1 = follow the region (default),
+    # 2 = 24-hour. Only a clock forced to 12-hour needs changing.
+    for group in find_clock_applets():
+        if kread(CLOCK_APPLETS_FILE.name, group + ["Configuration", "Appearance"], "use24hFormat") == "0":
+            kwrite(CLOCK_APPLETS_FILE.name, group + ["Configuration", "Appearance"], "use24hFormat", "2")
+    say("   The panel clock switches after the reboot at the end of this stage.")
 
 
 def system_update():
@@ -2372,6 +2448,7 @@ def collect_checks(post_reboot):
             continue
         rows.append(("group", group, user_in_group(group)))
     rows.append(("shell", "~/.bashrc.d snippet", SHELL_SNIPPET.exists()))
+    rows.append(("time", f"24-hour time ({TIME_LOCALE})", time_is_24h()))
 
     if post_reboot:
         rows += verify_checks()
@@ -2426,6 +2503,7 @@ RETRY = {
     "service": setup_services,
     "group": setup_services,
     "shell": install_shell_config,
+    "time": set_24h_time,
 }
 
 
