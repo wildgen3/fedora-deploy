@@ -51,4 +51,6 @@ The package lists are at the top of the script. Edit them there.
 
 - **RX 6600 (gfx1032):** ROCm doesn't support this GPU, so ollama gets `HSA_OVERRIDE_GFX_VERSION=10.3.0` and ramalama uses its Vulkan image. This only applies when an RX 6600-class card is detected.
 - **API keys** go in `~/.config/api-keys.env` (mode 600) and are loaded only by `agents`. Exported globally, they would make the Claude, Gemini and Codex CLIs bill the key instead of your subscription.
+- **Antigravity:** Google's RPM repo may only carry the 1.x releases (2.x has shipped as a tarball). If `dnf info antigravity` shows an old version, install 2.x from antigravity.google instead.
+- **ChatGPT:** OpenAI publishes no key URL, so the script installs the first RPM directly. That RPM adds OpenAI's signed repo, and later updates come through `dnf upgrade`.
 - **Steam Deck streaming:** install Moonlight on the Deck from Discover, then pair it with Sunshine at `https://localhost:47990`. Steam Remote Play works too, with no setup.

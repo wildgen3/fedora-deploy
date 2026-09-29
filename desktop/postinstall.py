@@ -78,11 +78,11 @@ gpgkey=https://packages.microsoft.com/keys/microsoft.asc
     "google-cloud-cli": """\
 [google-cloud-cli]
 name=Google Cloud CLI
-baseurl=https://packages.cloud.google.com/yum/repos/cloud-sdk-el9-x86_64
+baseurl=https://packages.cloud.google.com/yum/repos/cloud-sdk-el10-x86_64
 enabled=1
 gpgcheck=1
 repo_gpgcheck=0
-gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key-v10.gpg
 """,
     "antigravity": """\
 [antigravity-rpm]
@@ -92,17 +92,11 @@ enabled=1
 # Google publishes this repo unsigned (same as their own instructions).
 gpgcheck=0
 """,
-    "chatgpt": """\
-[openai-chatgpt]
-name=ChatGPT
-baseurl=https://persistent.oaistatic.com/codex-app-prod/linux/rpm/$basearch
-enabled=1
-type=rpm-md
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://persistent.oaistatic.com/codex-app-prod/linux/rpm/public.key
-""",
 }
+
+# OpenAI publishes no key URL: its first RPM installs the signing key and
+# OpenAI's signed repo, and later updates come through dnf from that repo.
+CHATGPT_RPM = "https://persistent.oaistatic.com/codex-app-prod/linux/rpm/latest/chatgpt.x86_64.rpm"
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
 REPO_URLS = {
@@ -134,13 +128,16 @@ RPM_GROUPS = {
     "local AI": ["ollama", "ramalama", "llama-cpp", "rocm-hip", "rocm-opencl", "rocminfo"],
     # -secret stores saved passwords in KWallet (through the Secret Service).
     "remote desktop": ["remmina", "remmina-plugins-rdp", "remmina-plugins-vnc",
-                       "remmina-plugins-secret"],
+                       "remmina-plugins-secret", "remmina-plugins-kwallet"],
     # @virtualization = QEMU/KVM + libvirt + virt-manager. swtpm (virtual TPM)
     # and edk2-ovmf (UEFI) are what Windows 11 VMs need.
     "virtual machines": ["@virtualization", "swtpm", "swtpm-tools", "edk2-ovmf"],
     # steam-devices: udev rules so controllers (and the Steam Deck) work.
     "gaming (host side)": ["steam-devices", "gamemode"],
 }
+
+# Nice to have, but not in every Fedora release: skipped quietly if missing.
+OPTIONAL_RPMS = {"remmina-plugins-kwallet"}
 
 # Packages from the vendor repos and COPRs above.
 VENDOR_GROUPS = {
@@ -201,7 +198,7 @@ NPM_GLOBALS = {"@google/gemini-cli": "gemini", "@openai/codex": "codex"}
 
 CLAUDE_INSTALLER = "https://claude.ai/install.sh"
 
-UV_TOOLS = {"huggingface_hub[cli]": "hf"}
+UV_TOOLS = {"huggingface_hub": "hf"}
 
 # Shared scratch environment for agent SDK experiments; real projects pin
 # their own copies. `agents` in a terminal activates it.
@@ -291,7 +288,7 @@ ROCM_PROFILE_CONTENT = f"""\
 # ---- services, groups, firewall
 
 SYSTEM_SERVICES = ["tailscaled.service", "ollama.service"]
-USER_SERVICES = ["sunshine.service"]
+USER_SERVICES = ["app-dev.lizardbyte.app.Sunshine.service"]
 # libvirt: manage VMs without a password. render/video: GPU compute (ROCm).
 GROUPS = ["libvirt", "render", "video"]
 # Opened in the default firewall zone (Fedora's desktop zone already allows
@@ -310,8 +307,8 @@ SIGNIN_APPS = [
     ("VS Code", ["code"],
      "Accounts (bottom left) > Backup and Sync Settings. Then sign in to Claude Code, "
      "Gemini Code Assist and Cline from their sidebar icons."),
-    ("Antigravity", ["antigravity"], "Sign in with your Google account."),
-    ("ChatGPT", ["chatgpt", "openai-chatgpt", "ChatGPT"], "Sign in to your OpenAI account."),
+    ("Antigravity", ["antigravity", "antigravity-ide"], "Sign in with your Google account."),
+    ("ChatGPT", ["chatgpt", "ChatGPT"], "Sign in to your OpenAI account."),
     ("Discord", ["com.discordapp.Discord"], "Sign in."),
     ("Spotify", ["com.spotify.Client"], "Sign in."),
     ("Steam", ["com.valvesoftware.Steam"],
@@ -659,6 +656,8 @@ def install_packages(names, label):
         # A dry run doesn't add the repos, so vendor packages can't be found yet.
         if DRY_RUN or package_available(name):
             wanted.append(name)
+        elif name in OPTIONAL_RPMS:
+            skipped(f"{name}: optional, not in this Fedora release")
         else:
             failed(f"{name}: not found in the enabled repositories")
     if not wanted:
@@ -779,6 +778,12 @@ def setup_repos():
             write_root_file(path, r.stdout)
         else:
             failed(f"download {url}")
+
+    say("-- ChatGPT (its RPM adds OpenAI's signed repo)")
+    if rpm_installed("chatgpt"):
+        say("   already installed")
+    elif run(["sudo", "dnf", "install", "-y", CHATGPT_RPM]).returncode != 0:
+        failed("install ChatGPT (adds OpenAI's repo)")
 
     say("-- COPRs")
     for copr, what in COPRS.items():
@@ -1051,6 +1056,8 @@ def collect_checks():
     rows = []
     for label, names in {**RPM_GROUPS, **VENDOR_GROUPS}.items():
         for name in names:
+            if name in OPTIONAL_RPMS:
+                continue
             rows.append(("rpm", f"{name} ({label})", rpm_installed(name)))
     for old, new in CODEC_SWAPS:
         rows.append(("codecs", new, rpm_installed(new)))
@@ -1064,8 +1071,10 @@ def collect_checks():
         rows.append(("steam-ext", label, bool(branch) and flatpak_installed(ext, branch)))
 
     env = tool_env()
-    for cmd in ["claude", *NPM_GLOBALS.values(), *UV_TOOLS.values(), "gcloud", "code", "uv"]:
-        ok = have_tool(cmd) and run([cmd, "--version"], changes_system=False, env=env).returncode == 0
+    for cmd in ["claude", *NPM_GLOBALS.values(), *UV_TOOLS.values(), "gcloud", "code", "uv", "node"]:
+        # hf has no --version; its help screen proves it runs.
+        probe = "--help" if cmd == "hf" else "--version"
+        ok = have_tool(cmd) and run([cmd, probe], changes_system=False, env=env).returncode == 0
         rows.append(("cli", cmd, ok))
 
     python = AGENTS_VENV / "bin" / "python"
@@ -1210,12 +1219,12 @@ def gcloud_adc():
         run(["gcloud", "auth", "application-default", "set-quota-project", project])
 
 
-CLAUDE_CREDS = HOME / ".claude" / ".credentials.json"
+def claude_cmd():
+    return str(LOCAL_BIN / "claude") if (LOCAL_BIN / "claude").exists() else "claude"
 
 
 def claude_login():
-    say("   Claude Code opens. Follow its login prompts (or type /login), then type /exit.")
-    interactive([str(LOCAL_BIN / "claude") if (LOCAL_BIN / "claude").exists() else "claude"])
+    interactive([claude_cmd(), "auth", "login"])
 
 
 GEMINI_CREDS = HOME / ".gemini" / "oauth_creds.json"
@@ -1284,12 +1293,20 @@ def api_keys():
         write_user_file(API_KEYS_FILE, content, mode=0o600)
 
 
-def find_desktop_file(ids):
+def find_desktop_file(ids, label):
+    """The app's .desktop file: by id first, then by its menu name."""
     for app_id in ids:
         for d in APP_DIRS:
             f = d / f"{app_id}.desktop"
             if f.exists():
                 return f
+    for d in APP_DIRS:
+        for f in sorted(d.glob("*.desktop")) if d.is_dir() else []:
+            try:
+                if f"\nName={label}\n" in f.read_text(errors="replace"):
+                    return f
+            except OSError:
+                continue
     return None
 
 
@@ -1305,7 +1322,7 @@ def open_apps():
         if ask("   Enter = open it, s = skip: ").lower() == "s":
             TODO.append(f"{label}: {what}")
             continue
-        desktop = find_desktop_file(ids)
+        desktop = find_desktop_file(ids, label)
         if not desktop:
             failed(f"open {label}: not installed")
             TODO.append(f"{label}: {what}")
@@ -1347,7 +1364,8 @@ def stage3_signin():
            "gcloud auth login")
     signin("Google Cloud credentials for SDKs (ADC)", ADC_FILE.exists, gcloud_adc,
            "gcloud auth application-default login")
-    signin("Claude Code", CLAUDE_CREDS.exists, claude_login, "Claude Code: run `claude` and log in")
+    signin("Claude Code", lambda: succeeds([claude_cmd(), "auth", "status"]), claude_login,
+           "claude auth login")
     signin("Gemini CLI", GEMINI_CREDS.exists, gemini_login, "Gemini CLI: run `gemini` and log in with Google")
     signin("Codex CLI", lambda: succeeds(["codex", "login", "status"]), codex_login, "codex login")
     signin("Hugging Face", lambda: succeeds(["hf", "auth", "whoami"]), hf_login, "hf auth login")
@@ -1399,6 +1417,10 @@ def main():
     say(f"{SCRIPT} started {datetime.datetime.now():%Y-%m-%d %H:%M:%S}"
         f"{' (DRY RUN: nothing will be changed)' if DRY_RUN else ''}")
     say(f"Log: {LOG_FILE}")
+
+    # Tools installed into ~/.local/bin (Claude, Gemini, Codex, hf) must be
+    # findable even when Konsole was started by the autostart, not a login shell.
+    os.environ["PATH"] = f"{LOCAL_BIN}:{os.environ.get('PATH', '')}"
 
     check_fedora()
     if args.check:
