@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""postinstall.py - personal software and tooling for a Fedora KDE desktop.
+"""postinstall.py - personal software, tooling and performance tweaks for a
+Fedora KDE Plasma desktop or laptop.
 
 Download it, then run it as your normal user, never as root:
 
@@ -7,36 +8,42 @@ Download it, then run it as your normal user, never as root:
     python3 postinstall.py              # run (or continue) the setup
     python3 postinstall.py --dry-run    # only print what would change
 
-It runs in three stages with a reboot between them. After each reboot a
-Konsole window opens on its own once you log in and carries on where it left
-off (you can also just run the same command again):
+Every run starts by detecting the hardware (CPU and GPU maker, laptop or
+desktop, Framework board) and only applies what matches. A machine can match
+several blocks: AMD CPU, Intel CPU, AMD GPU, Intel GPU, laptop, Framework.
 
-  Stage 1  Clean base: safety checks, one sudo password prompt, hardware
-           detection, full system update (dnf), firmware updates (fwupd, with
-           the pending updates listed first; laptops must be on the charger),
-           Flatpak updates. Reboot.
-  Stage 2  Install: official repos (RPM Fusion, Google, Microsoft, OpenAI,
-           Tailscale, Sunshine's COPR, virtio-win, Flathub), RPMs, Flatpaks,
-           the Claude / Gemini / Codex / Hugging Face CLIs, the agent SDK
-           environment, VS Code extensions, Antigravity (current version read
-           from Google's download page), GPU-specific drivers (AMD or Intel,
-           detected), services and
-           groups. Then a validation pass: every item is checked, anything
-           missing is retried once, and a pass/fail table is printed. Reboot.
-  Stage 3  Sign-in: git identity, SSH key, GitHub, Google Cloud, Claude,
-           Gemini, Codex, Hugging Face, Google Drive (mounted at ~/GoogleDrive),
-           Tailscale and API keys, then each app
-           that needs a sign-in is opened one at a time. Anything skipped is
-           written to a to-do file on your Desktop.
+It runs in stages. After each reboot a Konsole window opens on its own once you
+log in and carries on where it left off (or just run the same command again):
 
-Other options:
-    --stage N   run only stage N (1, 2 or 3)
-    --auth      same as --stage 3 (sign-ins only; skips ones already done)
-    --check     only the validation pass (read-only)
+  Stage 1  Clean base: safety checks, one sudo password prompt, full system
+           update, firmware updates (listed first, installed after you
+           confirm; laptops must be on the charger), Flatpak updates. Reboot.
+  Stage 2  Install ("Phase A"): repos, packages, Flatpaks, AI CLIs and SDKs,
+           VS Code extensions, Antigravity, Google Drive mount, performance
+           tweaks (sysctl, I/O schedulers, noatime, ananicy-cpp, GameMode),
+           kernel arguments, GPU tooling, laptop power settings and, on a
+           Framework laptop, hibernation. Then a validation pass: every item
+           is checked, anything missing is retried once. Reboot.
+  Stage 3  Configure and sign in ("Phase B"): checks that kernel arguments and
+           services are live, GameMode's AMD GPU settings, variable refresh
+           rate, Phoronix Test Suite and MangoHud logging, lid-close hibernate
+           (Framework) with a test, then every sign-in, then each app.
+  Stage 4  Baseline benchmarks ("Phase C"): runs the list in
+           ~/.config/desktop-postinstall/benchmarks.txt once at stock settings
+           and saves the results under ~/benchmarks/<machine>/.
+
+Options:
+    --with NAME[,NAME]  turn on opt-in extras (remembered); --list-options shows them
+    --without NAME      turn one off again
+    --stage N           run only stage N (1-4)
+    --auth              sign-ins only (skips ones already done)
+    --benchmark         stage 4 only
+    --check             only the validation pass, including post-reboot checks (read-only)
+    --verbose           also print every command as it runs
 
 Everything is logged to ~/postinstall-logs/. Running it twice is harmless:
-finished steps are detected and skipped. Only the Python standard library is
-used.
+finished steps are detected and skipped. Every tweak is a separate file that
+can be deleted to revert. Only the Python standard library is used.
 """
 
 import argparse
@@ -44,11 +51,13 @@ import datetime
 import getpass
 import grp
 import json
+import math
 import os
 import pwd
 import re
 import shlex
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -57,14 +66,36 @@ import threading
 from pathlib import Path
 from urllib.parse import unquote, urljoin
 
-# ----------------------------------------------------------------- settings
+# ================================================================ settings
 
 SCRIPT = "postinstall.py"
+HOME = Path.home()
+LOCAL_BIN = HOME / ".local" / "bin"
 
-# ---- repositories (all from the software's own publisher)
+# ---- opt-in extras: off unless turned on with --with NAME (remembered).
+# name: (what it does, hardware block it needs or None)
+OPTIONS = {
+    "heroic": ("Heroic Games Launcher: Epic, GOG and Amazon games", None),
+    "lutris": ("Lutris: launcher for other stores and emulators", None),
+    "scx": ("sched_ext CPU schedulers (scx_lavd, scx_bpfland, ...) + scx_loader/scxctl + GUI", None),
+    "rt-tests": ("cyclictest: scheduling latency, to compare schedulers", None),
+    "fio": ("disk I/O benchmark, to compare I/O schedulers", None),
+    "tuned-switcher": ("TuneD Switcher: pick any tuned profile, beyond KDE's three", None),
+    "full-ffmpeg": ("swap Fedora's ffmpeg-free for RPM Fusion's full ffmpeg (replaces a Fedora package)", None),
+    "thermald": ("Intel's thermal daemon; test per machine, some laptops run better without it", "intel-cpu"),
+    "ryzenadj": ("power-limit tuning for AMD laptop/APU chips", "amd-cpu"),
+    "zenpower": ("zenpower3 + zenmonitor3: Ryzen power/voltage readings (third-party COPR, "
+                 "unsigned kernel module: needs Secure Boot off; replaces k10temp)", "amd-cpu"),
+    "igpu-overclock": ("amdgpu.ppfeaturemask on a laptop's AMD iGPU (re-test sleep after)", "laptop"),
+    "framework-tool": ("Framework's framework_tool: battery charge limit, keyboard light, EC status",
+                       "framework"),
+    "audio-no-powersave": ("stop audio pops/buzz from sound-chip power saving (small battery cost)",
+                           "laptop"),
+}
 
-# Written to /etc/yum.repos.d/<name>.repo. Each entry is exactly what the
-# vendor's own install instructions add.
+# ---- repositories (the software's own publisher, or Fedora / RPM Fusion)
+
+# Written to /etc/yum.repos.d/<name>.repo, exactly as the vendor documents them.
 REPO_FILES = {
     "google-chrome": """\
 [google-chrome]
@@ -96,8 +127,8 @@ gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key-v10.gpg
 }
 
 # The ChatGPT desktop app for Linux includes Codex (and ChatGPT Work). OpenAI
-# publishes no key URL: its first RPM installs the signing key and
-# OpenAI's signed repo, and later updates come through dnf from that repo.
+# publishes no key URL: its first RPM installs the signing key and OpenAI's
+# signed repo, and later updates come through dnf from that repo.
 CHATGPT_RPM = "https://persistent.oaistatic.com/codex-app-prod/linux/rpm/latest/chatgpt.x86_64.rpm"
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
@@ -107,69 +138,174 @@ REPO_URLS = {
     "virtio-win": "https://fedorapeople.org/groups/virt/virtio-win/virtio-win.repo",
 }
 
-# COPRs run by the software's own developers.
-COPRS = {
-    "lizardbyte/stable": "Sunshine (LizardByte, Sunshine's developers)",
-}
+# COPRs (Fedora's community package build service, like Arch's AUR).
+# (name, what, hardware block/option tag or None, only these packages or None)
+COPRS = [
+    ("lizardbyte/stable", "Sunshine, from its developers (LizardByte)", None, None),
+    # CachyOS project's Fedora ports. Limited to these packages so nothing else
+    # from it (like cachyos-settings) can replace a Fedora package.
+    ("bieszczaders/kernel-cachyos-addons", "ananicy-cpp, CachyOS rules and sched_ext tools", None,
+     ["ananicy-cpp", "cachyos-ananicy-rules", "scx-scheds", "scx-tools", "scx-manager"]),
+    ("ilyaz/LACT", "LACT, from its developer", "amd-gpu", None),
+    ("shdwchn10/zenpower3", "zenpower3 (third-party packager)", "opt:zenpower", None),
+]
 
 RPMFUSION = [
     "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-{rel}.noarch.rpm",
     "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{rel}.noarch.rpm",
 ]
 
-# ---- RPM packages, grouped so a problem in one group doesn't block the others
+# ---- RPM packages: the editable package list. One line per package with what
+# it's for. Groups install together, so a problem in one doesn't block the
+# others. Tag: None = every machine; a hardware block ("amd-gpu", "laptop",
+# ...); or "opt:NAME" = only with --with NAME.
+RPM_GROUPS = [
+    ("command-line basics", None, [
+        ("git", "version control"),
+        ("gh", "GitHub CLI: PRs, issues, and git sign-in"),
+        ("curl", "downloads from the command line"),
+        ("jq", "reads and filters JSON"),
+        ("ripgrep", "fast text search (rg)"),
+        ("fzf", "fuzzy finder for files and shell history"),
+        ("btop", "system monitor: CPU, memory, disks, network"),
+        ("tmux", "split terminals and sessions that survive disconnects"),
+        ("unzip", "extracts .zip files"),
+        ("7zip", "7-Zip archiver (7z)"),
+        ("fastfetch", "system summary in the terminal"),
+    ]),
+    ("Python and Node", None, [
+        ("python3", "Python"),
+        ("python3-pip", "Python package installer"),
+        ("python3-devel", "headers for Python packages with C parts"),
+        ("python3.13", "Python 3.13 for the agent SDK environment (newest all SDKs support)"),
+        ("uv", "fast Python package and environment manager"),
+        ("nodejs", "Node.js, for the Gemini and Codex CLIs"),
+        ("npm", "Node package manager"),
+        ("gcc", "C compiler, for packages that build native code"),
+        ("gcc-c++", "C++ compiler"),
+        ("make", "build tool"),
+    ]),
+    ("containers", None, [
+        ("podman", "containers (Docker-compatible); ramalama uses it"),
+    ]),
+    ("local AI", None, [
+        ("ollama", "runs local language models (uses ROCm on AMD GPUs)"),
+        ("ramalama", "runs local models in containers"),
+        ("llama-cpp", "llama.cpp command-line tools"),
+    ]),
+    ("remote desktop", None, [
+        ("remmina", "remote desktop client"),
+        ("remmina-plugins-rdp", "RDP: Windows, and KDE's KRDP"),
+        ("remmina-plugins-vnc", "VNC"),
+        ("remmina-plugins-secret", "saves passwords in KWallet (Secret Service)"),
+        ("remmina-plugins-kwallet", "direct KWallet plugin (optional: not in every release)"),
+    ]),
+    ("virtual machines", None, [
+        ("@virtualization", "QEMU/KVM, libvirt and virt-manager"),
+        ("swtpm", "virtual TPM chip (Windows 11 needs one)"),
+        ("swtpm-tools", "swtpm setup tools"),
+        ("edk2-ovmf", "UEFI firmware for VMs"),
+    ]),
+    ("Google Drive mount", None, [
+        ("rclone", "mounts Google Drive at ~/GoogleDrive"),
+        ("fuse3", "lets rclone mount it as a normal folder"),
+    ]),
+    ("gaming", None, [
+        ("steam-devices", "udev rules so controllers and the Steam Deck work"),
+        ("gamemode", "Feral GameMode: performance governor (and AMD GPU clocks) while a game runs; "
+                     "per game: gamemoderun %command%"),
+        ("mangohud", "in-game overlay: FPS, frame times, temperatures, clocks; logs to CSV"),
+        ("gamescope", "Valve's micro-compositor: scaling, frame limits, HDR, fullscreen fixes"),
+    ]),
+    ("process priority", None, [
+        ("ananicy-cpp", "sets process priority from rules: games up, compilers/indexers/backups down"),
+        ("cachyos-ananicy-rules", "CachyOS's rules database, used as-is (your overrides: /etc/ananicy.d/99-custom/)"),
+    ]),
+    ("power", None, [
+        ("tuned", "Fedora's power/performance profile daemon"),
+        ("tuned-ppd", "lets KDE's power menu (Power Saver / Balanced / Performance) drive tuned"),
+    ]),
+    ("monitoring", None, [
+        ("lm_sensors", "CPU/board temperatures and fan speeds (feeds MangoHud and KDE widgets)"),
+        ("powertop", "what draws power and what wakes the system; --csv output"),
+        ("vulkan-tools", "vulkaninfo and friends, for diagnosing Vulkan"),
+        ("libva-utils", "vainfo: checks hardware video decode/encode"),
+    ]),
+    ("benchmarking", None, [
+        ("phoronix-test-suite", "repeatable, unattended benchmarks; results kept local (upload off)"),
+        ("vkmark", "Vulkan GPU benchmark"),
+        ("glmark2", "OpenGL GPU benchmark"),
+        ("stress-ng", "CPU/memory/cache stress: stability and thermal soak after tuning"),
+        ("sysbench", "quick CPU and memory throughput benchmarks"),
+        ("kernel-tools", "turbostat (per-core clocks, C-states, package power) and cpupower"),
+        ("s-tui", "terminal UI: stress test with live frequency/temperature/power graphs"),
+    ]),
+    ("codecs (RPM Fusion)", None, [
+        ("gstreamer1-plugins-bad-freeworld", "GStreamer codecs Fedora can't ship"),
+        ("gstreamer1-plugins-ugly", "more GStreamer codecs"),
+        ("gstreamer1-plugin-libav", "GStreamer's FFmpeg-based codecs"),
+    ]),
+    # Google Chrome, VS Code, ... from the vendors' repos.
+    ("Google Chrome", None, [("google-chrome-stable", "Chrome browser (Google's repo)")]),
+    ("VS Code", None, [("code", "Visual Studio Code (Microsoft's repo)")]),
+    ("ChatGPT", None, [("chatgpt", "ChatGPT desktop, with Codex (OpenAI's repo)")]),
+    ("Google Cloud CLI", None, [
+        ("google-cloud-cli", "gcloud"),
+        ("google-cloud-cli-gke-gcloud-auth-plugin", "sign-in plugin for GKE clusters"),
+        ("kubectl", "Kubernetes CLI"),
+        ("google-cloud-cli-skaffold", "build/deploy loop for Kubernetes apps"),
+    ]),
+    ("Tailscale", None, [("tailscale", "private network between your machines (Tailscale's repo)")]),
+    ("Sunshine", None, [("Sunshine", "streams this PC to Moonlight (e.g. the Steam Deck)")]),
+    ("virtio-win drivers", None, [("virtio-win", "Windows VM drivers ISO")]),
+    # ---- hardware blocks
+    ("AMD GPU", "amd-gpu", [
+        ("lact", "AMD GPU control: clocks, undervolt, power limit, fan curves (+ lactd daemon)"),
+        ("rocm-hip", "ROCm runtime: ollama and other apps compute on the AMD GPU"),
+        ("rocm-opencl", "OpenCL on ROCm"),
+        ("rocminfo", "shows what ROCm sees"),
+    ]),
+    ("Intel GPU", "intel-gpu", [
+        ("igt-gpu-tools", "intel_gpu_top: live Intel GPU usage"),
+    ]),
+    ("hibernation", "hibernate", [
+        ("policycoreutils-python-utils", "semanage, to label the hibernation swap file for SELinux"),
+        ("mokutil", "reads the Secure Boot state"),
+    ]),
+    ("Framework AMD", "framework-amd", [
+        ("amd-debug-tools", "amd_s2idle: AMD sleep diagnostics (optional: not in every release)"),
+    ]),
+    # ---- opt-in extras
+    ("sched_ext schedulers", "opt:scx", [
+        ("scx-scheds", "sched_ext CPU schedulers (scx_lavd, scx_bpfland, ...) on the stock kernel"),
+        ("scx-tools", "scx_loader and scxctl: start and switch schedulers"),
+        ("scx-manager", "simple GUI for picking a scheduler"),
+    ]),
+    ("latency test", "opt:rt-tests", [("rt-tests", "cyclictest: scheduling latency")]),
+    ("disk benchmark", "opt:fio", [("fio", "disk I/O benchmark")]),
+    ("Intel thermal daemon", "opt:thermald", [("thermald", "manages heat before hardware throttling")]),
+    ("AMD power limits", "opt:ryzenadj", [("ryzenadj", "AMD laptop/APU power limits (optional: may not be packaged)")]),
+    ("zenpower", "opt:zenpower", [
+        ("zenpower3", "Ryzen temperature/power/voltage driver (optional: third-party COPR)"),
+        ("zenmonitor3", "GUI for zenpower3 readings (optional: third-party COPR)"),
+    ]),
+]
 
-RPM_GROUPS = {
-    "command-line basics": ["git", "gh", "curl", "jq", "ripgrep", "fzf", "btop",
-                            "tmux", "unzip", "7zip", "fastfetch"],
-    # python3.13: the agent SDK environment uses it (newest Python the SDKs all support).
-    "Python and Node": ["python3", "python3-pip", "python3-devel", "python3.13", "uv",
-                        "nodejs", "npm", "gcc", "gcc-c++", "make"],
-    "containers": ["podman"],
-    "local AI": ["ollama", "ramalama", "llama-cpp"],
-    # -secret stores saved passwords in KWallet (through the Secret Service).
-    "remote desktop": ["remmina", "remmina-plugins-rdp", "remmina-plugins-vnc",
-                       "remmina-plugins-secret", "remmina-plugins-kwallet"],
-    # @virtualization = QEMU/KVM + libvirt + virt-manager. swtpm (virtual TPM)
-    # and edk2-ovmf (UEFI) are what Windows 11 VMs need.
-    "virtual machines": ["@virtualization", "swtpm", "swtpm-tools", "edk2-ovmf"],
-    # rclone mounts Google Drive as a folder (FUSE); see GDRIVE_* below.
-    "Google Drive mount": ["rclone", "fuse3"],
-    # steam-devices: udev rules so controllers (and the Steam Deck) work.
-    "gaming (host side)": ["steam-devices", "gamemode"],
-}
+# Skipped quietly if this Fedora release doesn't have them.
+OPTIONAL_RPMS = {"remmina-plugins-kwallet", "mesa-vdpau-drivers-freeworld", "amd-debug-tools",
+                 "ryzenadj", "zenpower3", "zenmonitor3"}
 
-# Nice to have, but not in every Fedora release: skipped quietly if missing.
-OPTIONAL_RPMS = {"remmina-plugins-kwallet"}
-
-# Packages from the vendor repos and COPRs above.
-VENDOR_GROUPS = {
-    "Google Chrome": ["google-chrome-stable"],
-    "VS Code": ["code"],
-    "ChatGPT": ["chatgpt"],
-    "Google Cloud CLI": ["google-cloud-cli", "google-cloud-cli-gke-gcloud-auth-plugin",
-                         "kubectl", "google-cloud-cli-skaffold"],
-    "Tailscale": ["tailscale"],
-    "Sunshine": ["Sunshine"],
-    "virtio-win drivers": ["virtio-win"],
-}
-
-# RPM Fusion: full codecs. Fedora's own video drivers can't encode or decode
-# H.264/HEVC; RPM Fusion's builds can, which Sunshine (streaming to the Steam
-# Deck) and OBS need. (from, to) pairs are swapped in place.
-CODEC_SWAPS = [("ffmpeg-free", "ffmpeg"),
-               ("mesa-vulkan-drivers", "mesa-vulkan-drivers-freeworld")]
-# Per GPU maker, from the hardware detection. AMD video goes through Mesa;
-# Intel through Intel's media driver. ROCm lets ollama use an AMD GPU.
-GPU_SWAPS = {
-    "amd": [("mesa-va-drivers", "mesa-va-drivers-freeworld")],
-    "intel": [("libva-intel-media-driver", "intel-media-driver")],
-}
-GPU_PACKAGES = {
-    "amd": ["rocm-hip", "rocm-opencl", "rocminfo"],
-}
-CODEC_PACKAGES = ["gstreamer1-plugins-bad-freeworld", "gstreamer1-plugins-ugly",
-                  "gstreamer1-plugin-libav"]
+# Sanctioned codec swaps (Fedora package -> RPM Fusion build of the same thing).
+# Fedora strips patented video codecs; these put them back. (from, to, tag, what)
+SWAPS = [
+    ("mesa-va-drivers", "mesa-va-drivers-freeworld", "amd-gpu",
+     "AMD hardware H.264/H.265 video decode/encode (Sunshine, OBS, browsers)"),
+    ("mesa-vdpau-drivers", "mesa-vdpau-drivers-freeworld", "amd-gpu",
+     "the same for the VDPAU video API some players use"),
+    ("libva-intel-media-driver", "intel-media-driver", "intel-gpu",
+     "Intel hardware video decode/encode, full codec set"),
+    ("ffmpeg-free", "ffmpeg", "opt:full-ffmpeg", "FFmpeg with every codec"),
+]
 
 # ---- Antigravity (Google)
 
@@ -189,7 +325,7 @@ enabled=1
 # Google publishes this repo unsigned (same as their own instructions).
 gpgcheck=0
 """
-ANTIGRAVITY_DIR = Path.home() / ".local" / "opt"
+ANTIGRAVITY_DIR = HOME / ".local" / "opt"
 ANTIGRAVITY = {
     # file: the tarball's name in Google's URLs. fallback: the newest known URL
     # (2026-09-29), used only if the download page can't be read.
@@ -203,25 +339,27 @@ ANTIGRAVITY = {
                     "2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz"},
 }
 
-# ---- Flatpaks (Flathub, installed for your user only)
-
-FLATPAKS = {
-    "com.discordapp.Discord": "Discord",
-    "com.spotify.Client": "Spotify",
-    "md.obsidian.Obsidian": "Obsidian",
-    "com.orcaslicer.OrcaSlicer": "OrcaSlicer (filament printers)",
-    "io.mango3d.LycheeSlicer": "Lychee Slicer (resin printers)",
-    "com.valvesoftware.Steam": "Steam",
-    "com.vysp3r.ProtonPlus": "ProtonPlus (Proton versions)",
-    "com.obsproject.Studio": "OBS Studio",
-    "com.obsproject.Studio.Plugin.OBSVkCapture": "OBS game capture plugin",
-    "com.moonlight_stream.Moonlight": "Moonlight (streaming client)",
-}
+# ---- Flatpaks (Flathub, installed for your user only). (id, what, tag)
+FLATPAKS = [
+    ("com.discordapp.Discord", "Discord", None),
+    ("com.spotify.Client", "Spotify", None),
+    ("md.obsidian.Obsidian", "Obsidian: notes", None),
+    ("com.orcaslicer.OrcaSlicer", "OrcaSlicer: filament 3D printers", None),
+    ("io.mango3d.LycheeSlicer", "Lychee Slicer: resin 3D printers", None),
+    ("com.valvesoftware.Steam", "Steam (Remote Play included)", None),
+    ("com.vysp3r.ProtonPlus", "ProtonPlus: installs Proton-GE / Proton-CachyOS builds", None),
+    ("com.obsproject.Studio", "OBS Studio: recording and streaming", None),
+    ("com.obsproject.Studio.Plugin.OBSVkCapture", "OBS game capture plugin", None),
+    ("com.moonlight_stream.Moonlight", "Moonlight: game streaming client", None),
+    ("com.heroicgameslauncher.hgl", "Heroic: Epic, GOG and Amazon games", "opt:heroic"),
+    ("net.lutris.Lutris", "Lutris: other stores and emulators", "opt:lutris"),
+    ("org.easycoding.TunedSwitcher", "TuneD Switcher: any tuned profile", "opt:tuned-switcher"),
+]
 
 # Extensions Steam games can use. Installed at the branch that matches Steam's
 # runtime, which is read from Steam once it's installed.
 STEAM_EXTENSIONS = {
-    "org.freedesktop.Platform.VulkanLayer.MangoHud": "MangoHud (FPS overlay)",
+    "org.freedesktop.Platform.VulkanLayer.MangoHud": "MangoHud (FPS overlay, logging)",
     "org.freedesktop.Platform.VulkanLayer.gamescope": "gamescope",
     "org.freedesktop.Platform.VulkanLayer.vkBasalt": "vkBasalt (post-processing)",
     "org.freedesktop.Platform.VulkanLayer.OBSVkCapture": "OBS game capture layer",
@@ -230,9 +368,6 @@ STEAM_EXTENSIONS = {
 FLATHUB_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
 
 # ---- command-line tools and SDKs (installed in your home, no sudo)
-
-HOME = Path.home()
-LOCAL_BIN = HOME / ".local" / "bin"
 
 # npm installs "global" packages into ~/.local (so ~/.local/bin), not /usr.
 NPM_PREFIX = HOME / ".local"
@@ -273,7 +408,7 @@ VSCODE_EXTENSIONS = {
 
 # API keys for the SDKs. Kept in a private file and loaded only by `agents`,
 # never globally: a global ANTHROPIC_API_KEY (or GEMINI_/OPENAI_) makes the
-# Claude/Gemini/Codex CLIs bill that key instead of your subscription login.
+# Claude/Gemini/Codex CLIs bill that key instead of your subscription.
 API_KEYS_FILE = HOME / ".config" / "api-keys.env"
 API_KEYS = {
     "ANTHROPIC_API_KEY": "https://console.anthropic.com/settings/keys",
@@ -296,6 +431,46 @@ agents() {{
     fi
 }}
 """
+
+# ---- performance tweaks (drop-in files: delete one to revert it)
+
+SYSCTL_FILE = "/etc/sysctl.d/99-performance.conf"
+# Fedora already sets vm.max_map_count this high; only written if it isn't.
+MAX_MAP_COUNT = 1048576
+BBR_MODULE_FILE = "/etc/modules-load.d/tcp_bbr.conf"
+
+IOSCHED_RULES_FILE = "/etc/udev/rules.d/60-ioschedulers.rules"
+IOSCHED_RULES = f"""\
+# Managed by {SCRIPT}. I/O scheduler per disk type (the order disk requests
+# are served in). Delete this file to go back to the kernel's defaults.
+# NVMe: none (the drive schedules itself).
+ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{{queue/scheduler}}="none"
+# SATA/eMMC SSD: mq-deadline.
+ACTION=="add|change", KERNEL=="sd[a-z]*|mmcblk[0-9]*", ATTR{{queue/rotational}}=="0", ATTR{{queue/scheduler}}="mq-deadline"
+# Spinning disk: bfq.
+ACTION=="add|change", KERNEL=="sd[a-z]*", ATTR{{queue/rotational}}=="1", ATTR{{queue/scheduler}}="bfq"
+"""
+
+FSTAB = "/etc/fstab"
+FSTAB_BACKUP = "/etc/fstab.before-postinstall"
+
+ANANICY_CUSTOM_DIR = "/etc/ananicy.d/99-custom"
+ANANICY_CUSTOM_README = f"""\
+Your own ananicy-cpp rules (created by {SCRIPT}).
+
+This folder loads last, so anything here overrides the CachyOS rules in
+00-default/ without editing them (those are updated by the COPR package).
+
+  *.rules    process name -> type, e.g.  {{ "name": "blender", "type": "Heavy_CPU" }}
+  *.types    your own named priority profiles (nice, I/O class, ...)
+  *.cgroups  CPU budget groups
+
+After changing something: sudo systemctl restart ananicy-cpp
+"""
+
+GAMEMODE_INI = "/etc/gamemode.ini"
+
+KWINRC = ("kwinrc", ["Compositing"], "AllowTearing")
 
 # ---- AMD GPU
 
@@ -328,12 +503,80 @@ ROCM_PROFILE_CONTENT = f"""\
 # export HSA_OVERRIDE_GFX_VERSION=10.3.0
 """
 
+# ---- kernel arguments (set with grubby for every installed kernel)
+# (argument, tag, why). amd_pstate and the hibernate resume= arguments are
+# worked out at run time.
+KERNEL_ARGS = [
+    ("amdgpu.ppfeaturemask=0xffffffff", "amd-gpu-tuning",
+     "unlocks the AMD driver's overclock/undervolt controls, so LACT can tune (not just monitor)"),
+    ('acpi_osi="!Windows 2020"', "framework-intel",
+     "Framework Intel s2idle fix: keyboard light and power button turn off in suspend, ~1%/hour drain"),
+]
+
+# ---- laptop / Framework
+
+# KDE Power Management's power profile per state; KDE switches automatically
+# when you unplug or reach low battery. Values are the menu's profiles:
+# power-saver, balanced, performance. (Framework only, for now.)
+POWERDEVIL_PROFILES = {"AC": "balanced", "Battery": "balanced", "LowBattery": "power-saver"}
+
+AUDIO_MODPROBE = "/etc/modprobe.d/99-audio-no-powersave.conf"
+AUDIO_MODPROBE_CONTENT = f"""\
+# Managed by {SCRIPT} (--with audio-no-powersave). Stops the pop/buzz when the
+# sound chip powers down; costs a little battery. Delete this file to revert.
+options snd_hda_intel power_save=0
+"""
+ZENPOWER_MODPROBE = "/etc/modprobe.d/99-zenpower.conf"
+ZENPOWER_MODPROBE_CONTENT = f"""\
+# Managed by {SCRIPT} (--with zenpower). zenpower3 replaces k10temp (both read
+# the same sensors). Delete this file to go back to k10temp.
+blacklist k10temp
+"""
+FRAMEWORK_TOOL_URL = "https://github.com/FrameworkComputer/framework-system/releases/latest/download/framework_tool"
+FRAMEWORK_TOOL = "/usr/local/bin/framework_tool"
+
+# ---- hibernation (Framework laptops; lid close = lowest-drain state)
+
+# What closing the lid does: "hibernate" (RAM saved to disk, full power-off,
+# ~0% drain) or "suspend-then-hibernate" (sleep first for fast wake, then
+# hibernate after HIBERNATE_DELAY).
+LID_ACTION = "hibernate"
+HIBERNATE_DELAY = "30min"
+SWAP_SUBVOL = Path("/swap")               # own Btrfs subvolume: kept out of snapshots
+SWAP_FILE = SWAP_SUBVOL / "swapfile"
+SWAP_FSTAB_LINE = f"{SWAP_FILE} none swap defaults,pri=0 0 0"  # after zram (priority 100)
+LOGIND_LID = "/etc/systemd/logind.conf.d/10-lid.conf"
+SLEEP_CONF = "/etc/systemd/sleep.conf.d/10-hibernate.conf"
+SLEEP_CONF_CONTENT = f"""\
+# Managed by {SCRIPT}. Used by suspend-then-hibernate: sleep this long first.
+[Sleep]
+HibernateDelaySec={HIBERNATE_DELAY}
+"""
+DRACUT_RESUME = "/etc/dracut.conf.d/resume.conf"
+DRACUT_RESUME_CONTENT = f"""\
+# Managed by {SCRIPT}: lets the boot image find and restore a hibernation image.
+add_dracutmodules+=" resume "
+"""
+# KDE's lid action numbers (powerdevil: Sleep=1, Hibernate=2; SleepMode
+# SuspendThenHibernate=3).
+KDE_LID = {"hibernate": ("2", None), "suspend-then-hibernate": ("1", "3")}
+
 # ---- services, groups, firewall
 
-SYSTEM_SERVICES = ["tailscaled.service", "ollama.service"]
+# (unit, tag)
+SYSTEM_SERVICES = [
+    ("tailscaled.service", None),
+    ("ollama.service", None),
+    ("ananicy-cpp.service", None),
+    ("tuned.service", None),
+    ("tuned-ppd.service", None),
+    ("lactd.service", "amd-gpu"),
+    ("thermald.service", "opt:thermald"),
+]
 USER_SERVICES = ["app-dev.lizardbyte.app.Sunshine.service"]
 # libvirt: manage VMs without a password. render/video: GPU compute (ROCm).
-GROUPS = ["libvirt", "render", "video"]
+# gamemode: lets GameMode change the CPU governor and GPU clocks.
+GROUPS = ["libvirt", "render", "video", "gamemode"]
 # Opened in the default firewall zone (Fedora's desktop zone already allows
 # them; this covers other zones). Sunshine's web UI (47990) stays local-only.
 STREAMING_PORTS = {
@@ -350,9 +593,9 @@ SUNSHINE_WEB_UI = "https://localhost:47990"
 # normally. Google Docs/Sheets/Slides show up as .docx/.xlsx/.pptx exports. The
 # service is enabled once you sign in (stage 3, or --auth later).
 GDRIVE_REMOTE = "gdrive"
-GDRIVE_DIR = Path.home() / "GoogleDrive"
+GDRIVE_DIR = HOME / "GoogleDrive"
 GDRIVE_UNIT = "rclone-gdrive.service"
-GDRIVE_UNIT_FILE = Path.home() / ".config/systemd/user" / GDRIVE_UNIT
+GDRIVE_UNIT_FILE = HOME / ".config/systemd/user" / GDRIVE_UNIT
 GDRIVE_UNIT_CONTENT = f"""\
 # Managed by {SCRIPT}. Google Drive at ~/GoogleDrive (rclone remote "{GDRIVE_REMOTE}").
 [Unit]
@@ -391,6 +634,33 @@ GOOGLE_APPS = {
     "google-drive": ("Google Drive (web)", "https://drive.google.com/", "folder-cloud"),
 }
 
+# ---- benchmarks (stage 4) and logging
+
+BENCH_ROOT = HOME / "benchmarks"          # one folder per machine
+BENCH_LIST = HOME / ".config" / "desktop-postinstall" / "benchmarks.txt"
+BENCH_LIST_DEFAULT = """\
+# Baseline benchmark list (edit freely). One entry per line:
+#   pts/<profile>   a Phoronix Test Suite test, run unattended; results stay local
+#   run: <command>  any command; its output is saved as a text file.
+#                   {out} is replaced with this run's results folder.
+# Lines starting with # are ignored.
+pts/compress-7zip
+pts/c-ray
+run: sysbench cpu --threads=$(nproc) --time=30 run
+run: sysbench memory --threads=$(nproc) --time=30 run
+run: vkmark
+run: glmark2 --off-screen
+run: sudo turbostat --quiet --interval 5 --num_iterations 6
+run: sensors
+"""
+PTS_SETTINGS = ["SaveResults=TRUE", "OpenBrowser=FALSE", "UploadResults=FALSE",
+                "PromptForTestIdentifier=FALSE", "PromptForTestDescription=FALSE",
+                "PromptSaveName=FALSE", "RunAllTestCombinations=TRUE", "Configured=TRUE",
+                "AnonymousUsageReporting=FALSE", "AlwaysUploadSystemLogs=FALSE",
+                "AllowResultUploadsToOpenBenchmarking=FALSE"]
+PTS_CONFIG = HOME / ".phoronix-test-suite" / "user-config.xml"
+MANGOHUD_CONF = HOME / ".config" / "MangoHud" / "MangoHud.conf"
+
 # ---- stage 3: apps that need a sign-in, opened one at a time
 
 # (label, .desktop ids to try, what to do there)
@@ -428,14 +698,16 @@ MANUAL_TODO = [
     "(Add a Non-Steam Game) so it opens from Game Mode on the dock.",
     f"Pair Moonlight with Sunshine: open Moonlight on the Deck, pick this PC, and type the "
     f"PIN it shows into Sunshine's web page ({SUNSHINE_WEB_UI} > PIN).",
-    "ProtonPlus: install the latest GE-Proton for Steam.",
+    "ProtonPlus: install the latest GE-Proton (or Proton-CachyOS) for Steam.",
+    "Games: add `gamemoderun %command%` to a game's Steam launch options for GameMode; "
+    "`mangohud %command%` for the overlay (Shift_L+F2 starts/stops a CSV log).",
     "Windows VM: download the Windows 11 ISO from microsoft.com. In virt-manager, choose "
     "'Microsoft Windows 11' as the OS (adds UEFI + TPM), and attach "
     "/usr/share/virtio-win/virtio-win.iso as a second CD for the drivers.",
     "Local AI test: `ollama run llama3.2` and `ramalama run llama3.2`; keep whichever is faster.",
     "Antigravity IDE: add extensions from its own store (it doesn't share VS Code's).",
     f"Antigravity updates: when it says a new version is out, run "
-    f"`python3 {Path.home() / '.local/share/desktop-postinstall/postinstall.py'} --stage 2` "
+    f"`python3 {HOME / '.local/share/desktop-postinstall/postinstall.py'} --stage 2` "
     f"(tarball installs can't update themselves).",
 ]
 
@@ -443,6 +715,7 @@ MANUAL_TODO = [
 
 STATE_DIR = HOME / ".local" / "state" / "desktop-postinstall"
 STAGE_FILE = STATE_DIR / "stage"
+OPTIONS_FILE = STATE_DIR / "options"
 # A copy of this script, so the after-reboot autostart has a fixed path.
 INSTALLED_COPY = HOME / ".local" / "share" / "desktop-postinstall" / SCRIPT
 AUTOSTART = HOME / ".config" / "autostart" / "desktop-postinstall.desktop"
@@ -452,17 +725,22 @@ LOG_DIR = HOME / "postinstall-logs"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 LOG_FILE = LOG_DIR / f"desktop-postinstall-{STAMP}.log"
 
-# ------------------------------------------------------------------ state
+DONE = 5   # saved stage after stage 4
+
+# ================================================================ state
 
 DRY_RUN = False
+VERBOSE = False
 LOG = None            # open log file handle
 FAILURES = []         # things that went wrong but didn't stop the script
 SKIPPED = []          # things skipped on purpose (with the reason)
 NOTES = []            # reminders for the summary
-TODO = []             # sign-ins skipped in stage 3, for the Desktop to-do file
+TODO = []             # skipped sign-ins and follow-ups, for the Desktop to-do file
 FACTS = {}            # values collected along the way
+BLOCKS = set()        # hardware blocks this machine matches
+ENABLED = set()       # opt-in extras turned on with --with
 
-# ---------------------------------------------------------------- output
+# ================================================================ output
 
 
 def log(msg):
@@ -490,7 +768,7 @@ def failed(what):
 
 def skipped(what):
     SKIPPED.append(what)
-    warn(f"skipped: {what}")
+    say(f"   skipped: {what}")
 
 
 def fatal(msg):
@@ -501,29 +779,46 @@ def fatal(msg):
     sys.exit(1)
 
 
-def step(title):
-    say(f"\n==== {title} ====")
+def banner(title):
+    say("\n" + "=" * 64)
+    say(title)
+    say("=" * 64)
+
+
+def section(title):
+    say(f"-- {title}")
+
+
+def run_tasks(title, tasks):
+    """Run a stage's steps in order with a progress bar."""
+    banner(title)
+    total = len(tasks)
+    for i, (label, fn) in enumerate(tasks, 1):
+        filled = round(24 * i / total)
+        say(f"\n[{'█' * filled}{'░' * (24 - filled)}] {i}/{total}  {label}")
+        fn()
 
 
 def run(cmd, changes_system=True, input_text=None, env=None):
-    """Print, run and log one command. Returns a CompletedProcess.
+    """Run and log one command. Returns a CompletedProcess.
 
     changes_system=True: the command modifies something. With --dry-run it is
     only printed. changes_system=False: a read-only lookup (rpm -q, dnf info,
-    flatpak info, ...). Those run even in a dry run so the preview can make
-    the same decisions a real run would.
+    flatpak info, ...). Those run even in a dry run so the preview can make the
+    same decisions a real run would. Commands and their output go to the log;
+    the terminal shows them only with --verbose, or the tail when one fails.
     """
     shown = shlex.join(cmd)
     if DRY_RUN and changes_system:
-        say(f"[dry-run] {shown}")
+        say(f"   [dry-run] {shown}")
         if input_text:
-            say("[dry-run]   with this content:")
+            say("   [dry-run]   with this content:")
             for line in input_text.splitlines():
-                say(f"[dry-run]     {line}")
+                say(f"   [dry-run]     {line}")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    if changes_system:
-        say(f"$ {shown}")
+    if VERBOSE and changes_system:
+        say(f"   $ {shown}")
     else:
         log(f"$ {shown}")
     try:
@@ -540,16 +835,16 @@ def run(cmd, changes_system=True, input_text=None, env=None):
     except FileNotFoundError as err:
         result = subprocess.CompletedProcess(cmd, 127, "", str(err))
 
-    # Full output goes to the log; the terminal only sees output on failure.
     if result.stdout.strip():
         log(result.stdout.rstrip())
     if result.stderr.strip():
         log(result.stderr.rstrip())
     log(f"(exit code {result.returncode})")
     if result.returncode != 0 and changes_system:
-        tail = (result.stdout + result.stderr).strip().splitlines()[-15:]
+        say(f"   command failed: {shown}")
+        tail = (result.stdout + result.stderr).strip().splitlines()[-12:]
         for line in tail:
-            say(f"    {line}")
+            say(f"      {line}")
     return result
 
 
@@ -564,15 +859,15 @@ def succeeds(cmd):
     return run(cmd, changes_system=False).returncode == 0
 
 
-def interactive(cmd):
+def interactive(cmd, env=None):
     """Run a command attached to the terminal (logins, prompts). Returns True on exit 0."""
     shown = shlex.join(cmd)
     if DRY_RUN:
-        say(f"[dry-run] {shown}")
+        say(f"   [dry-run] {shown}")
         return True
-    say(f"$ {shown}")
+    log(f"$ {shown}")
     try:
-        rc = subprocess.run(cmd).returncode
+        rc = subprocess.run(cmd, env=env).returncode
     except FileNotFoundError:
         rc = 127
     log(f"(exit code {rc})")
@@ -597,7 +892,14 @@ def yes(prompt, default=True):
     return answer in ("y", "yes")
 
 
-# ------------------------------------------------------ startup checks
+def read_sys(path):
+    try:
+        return Path(path).read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+# ================================================================ startup checks
 
 def read_os_release():
     """Parse /etc/os-release (KEY=value lines) into a dict."""
@@ -618,7 +920,7 @@ def check_fedora():
         fatal(f"this is {info.get('PRETTY_NAME', 'an unknown system')}, not Fedora.")
     FACTS["release"] = info.get("PRETTY_NAME", f"Fedora {info.get('VERSION_ID', '?')}")
     FACTS["version"] = info.get("VERSION_ID", "")
-    say(f"Detected: {FACTS['release']} (kernel {os.uname().release})")
+    say(f"System: {FACTS['release']} (kernel {os.uname().release})")
     if info.get("VARIANT_ID") != "kde":
         warn(f"expected the KDE edition, found variant '{info.get('VARIANT_ID', 'none')}'. Continuing.")
 
@@ -634,83 +936,6 @@ def check_wheel():
               "Make it an administrator (or: usermod -aG wheel <you> as root), log out and in, then rerun.")
 
 
-def read_sys(path):
-    try:
-        return Path(path).read_text(errors="replace").strip()
-    except OSError:
-        return ""
-
-
-# SMBIOS chassis types for portable machines (notebook, laptop, convertible, ...).
-LAPTOP_CHASSIS = {"8", "9", "10", "14", "30", "31", "32"}
-GPU_MAKERS = {"1002": "amd", "8086": "intel", "10de": "nvidia"}
-
-
-def detect_hardware():
-    """Read what this machine is, so later steps can match it (firmware, GPU
-    drivers, charger checks). Read-only; runs on every start."""
-    step("Hardware")
-    dmi = Path("/sys/class/dmi/id")
-    cpuinfo = read_sys("/proc/cpuinfo")
-    m = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
-    gpus = [line for cls in ("0300", "0302", "0380")
-            for line in output_of(["lspci", "-nn", "-d", f"::{cls}"]).splitlines() if line.strip()]
-    batteries = [d for d in Path("/sys/class/power_supply").glob("*")
-                 if read_sys(d / "type") == "Battery"]
-    hw = {
-        "vendor": read_sys(dmi / "sys_vendor"),
-        "model": read_sys(dmi / "product_name"),
-        "cpu": m.group(1).strip() if m else "unknown",
-        "gpus": gpus,
-        "gpu_makers": sorted({GPU_MAKERS[v] for line in gpus
-                              for v in re.findall(r"\[([0-9a-f]{4}):[0-9a-f]{4}\]", line)
-                              if v in GPU_MAKERS}),
-        "laptop": bool(batteries) or read_sys(dmi / "chassis_type") in LAPTOP_CHASSIS,
-        "batteries": batteries,
-        # systemd-detect-virt prints "none" (and exits 1) on real hardware.
-        "virt": run(["systemd-detect-virt"], changes_system=False).stdout.strip() or "none",
-    }
-    FACTS["hw"] = hw
-    say(f"Machine: {hw['vendor'] or '?'} {hw['model'] or ''}".rstrip()
-        + (" (laptop)" if hw["laptop"] else "") + (f" (virtual: {hw['virt']})" if hw["virt"] != "none" else ""))
-    say(f"CPU: {hw['cpu']}")
-    for line in gpus or ["none found by lspci"]:
-        say(f"GPU: {line}")
-    if hw["laptop"]:
-        say(f"Power: {'charger connected' if on_ac_power() else 'on battery'}"
-            + (f", battery {battery_percent()}%" if battery_percent() is not None else ""))
-
-
-def on_ac_power():
-    """True on a desktop, or when a laptop's charger is connected."""
-    if not FACTS["hw"]["batteries"]:
-        return True
-    for d in Path("/sys/class/power_supply").glob("*"):
-        if read_sys(d / "type") in ("Mains", "USB") and read_sys(d / "online") == "1":
-            return True
-    return False
-
-
-def battery_percent():
-    levels = [int(v) for v in (read_sys(b / "capacity") for b in FACTS["hw"]["batteries"]) if v.isdigit()]
-    return min(levels) if levels else None
-
-
-def ensure_ac_power(what):
-    """Laptops: don't start long updates or firmware flashing on battery."""
-    if on_ac_power():
-        return
-    if DRY_RUN:
-        say(f"[dry-run] on battery: a real run asks you to plug in before {what}")
-        return
-    warn(f"this laptop is on battery. Plug in the charger before {what}.")
-    while not on_ac_power():
-        if ask("   Press Enter once it's plugged in (s = continue on battery): ").lower() == "s":
-            warn(f"continuing {what} on battery")
-            return
-    say("   Charger connected.")
-
-
 def keep_sudo_alive(stop):
     """Background thread: refresh sudo's timestamp every 60 s until told to stop.
     -n means 'never prompt', so this can't hang if the timestamp is gone."""
@@ -719,9 +944,9 @@ def keep_sudo_alive(stop):
 
 
 def start_sudo():
-    say("This script needs your sudo password once for system-level steps.")
-    say("$ sudo -v")
-    # Read-only lookups (dnf info) use sudo too, so this also happens in a dry run.
+    say("\nThis script needs your sudo password once for system-level steps.")
+    # Read-only lookups (dnf info, grubby --info) use sudo too, so this also
+    # happens in a dry run.
     if subprocess.run(["sudo", "-v"]).returncode != 0:
         fatal("sudo -v failed (wrong password, or no sudo rights).")
     stop = threading.Event()
@@ -733,23 +958,165 @@ def username():
     return pwd.getpwuid(os.getuid()).pw_name
 
 
-# ------------------------------------------------------ stage bookkeeping
+# ================================================================ hardware detection
+
+def battery_dirs():
+    """Laptop batteries (BAT0, BAT1, ...). Mice and headsets report batteries
+    too, under other names, so they don't count."""
+    return sorted(Path("/sys/class/power_supply").glob("BAT*"))
+
+
+def drm_cards():
+    """[(index, driver, pci_address, vram_bytes)] for each GPU (/sys/class/drm/cardN)."""
+    cards = []
+    for card in sorted(Path("/sys/class/drm").glob("card*")):
+        m = re.fullmatch(r"card(\d+)", card.name)
+        if not m:
+            continue  # connectors like card0-DP-1
+        try:
+            driver = Path(os.readlink(card / "device" / "driver")).name
+        except OSError:
+            continue
+        pci = Path(os.path.realpath(card / "device")).name
+        vram = read_sys(card / "device" / "mem_info_vram_total")
+        cards.append((int(m.group(1)), driver, pci, int(vram) if vram.isdigit() else 0))
+    return cards
+
+
+def detect_hardware():
+    """Work out which hardware blocks apply. Read-only; runs on every start."""
+    banner("Hardware")
+    dmi = Path("/sys/class/dmi/id")
+    cpuinfo = read_sys("/proc/cpuinfo")
+    m = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
+    flags = re.search(r"^flags\s*:\s*(.+)$", cpuinfo, re.M)
+    cpu_vendor = ("amd" if "AuthenticAMD" in cpuinfo else
+                  "intel" if "GenuineIntel" in cpuinfo else "other")
+    cards = drm_cards()
+    drivers = {c[1] for c in cards}
+    batteries = battery_dirs()
+    vendor = read_sys(dmi / "sys_vendor")
+    product = read_sys(dmi / "product_name")
+    virt = run(["systemd-detect-virt"], changes_system=False).stdout.strip() or "none"
+    gpu_names = []
+    for idx, driver, pci, _ in cards:
+        name = output_of(["lspci", "-s", pci]) or pci
+        gpu_names.append(f"card{idx}: {name.split(': ', 1)[-1]} [{driver}]")
+
+    BLOCKS.clear()
+    BLOCKS.add(f"{cpu_vendor}-cpu")
+    if "amdgpu" in drivers:
+        BLOCKS.add("amd-gpu")
+    if drivers & {"i915", "xe"}:
+        BLOCKS.add("intel-gpu")
+    BLOCKS.add("laptop" if batteries else "desktop")
+    if vendor.strip().lower().startswith("framework"):
+        BLOCKS.add("framework")
+        BLOCKS.add(f"framework-{cpu_vendor}")
+    if "laptop" in BLOCKS and "framework" in BLOCKS and virt == "none":
+        BLOCKS.add("hibernate")
+    if "amd-gpu" in BLOCKS and ("desktop" in BLOCKS or "igpu-overclock" in ENABLED):
+        BLOCKS.add("amd-gpu-tuning")
+
+    FACTS["hw"] = {
+        "vendor": vendor, "model": product, "cpu": m.group(1).strip() if m else "unknown",
+        "cpu_vendor": cpu_vendor, "cpu_flags": flags.group(1).split() if flags else [],
+        "hybrid": Path("/sys/devices/cpu_core").exists(),
+        "cards": cards, "gpus": gpu_names, "batteries": batteries, "virt": virt,
+    }
+    say(f"Machine: {vendor or '?'} {product}".rstrip()
+        + (f" (virtual: {virt})" if virt != "none" else ""))
+    say(f"CPU:     {FACTS['hw']['cpu']}"
+        + (" (hybrid P/E cores)" if FACTS["hw"]["hybrid"] else ""))
+    for line in gpu_names or ["none found"]:
+        say(f"GPU:     {line}")
+    if "nvidia" in drivers or "nouveau" in drivers:
+        say("         (NVIDIA GPU found: this script never installs NVIDIA packages.)")
+    if batteries:
+        say(f"Power:   laptop, {'charger connected' if on_ac_power() else 'on battery'}"
+            + (f", battery {battery_percent()}%" if battery_percent() is not None else ""))
+    if "framework" in BLOCKS:
+        gen = re.search(r"(\d+)(?:st|nd|rd|th) Gen", product)
+        FACTS["framework_board"] = (f"{gen.group(1)}th gen Intel" if gen and cpu_vendor == "intel"
+                                    else "AMD" if cpu_vendor == "amd" else product)
+        say(f"Framework board: {FACTS['framework_board']}")
+    say(f"Blocks:  {', '.join(sorted(BLOCKS))}")
+    if ENABLED:
+        say(f"Extras:  {', '.join(sorted(ENABLED))}")
+
+
+def wanted(tag):
+    """Does this item apply here? None = everywhere; a block name; or opt:NAME."""
+    if not tag:
+        return True
+    if tag.startswith("opt:"):
+        name = tag[4:]
+        need = OPTIONS[name][1]
+        return name in ENABLED and (not need or need in BLOCKS)
+    return tag in BLOCKS
+
+
+def on_ac_power():
+    """True on a desktop, or when a laptop's charger is connected."""
+    if not FACTS.get("hw", {}).get("batteries", battery_dirs()):
+        return True
+    for d in Path("/sys/class/power_supply").glob("*"):
+        if read_sys(d / "type") in ("Mains", "USB") and read_sys(d / "online") == "1":
+            return True
+    return False
+
+
+def battery_percent():
+    bats = FACTS.get("hw", {}).get("batteries") or battery_dirs()
+    levels = [int(v) for v in (read_sys(b / "capacity") for b in bats) if v.isdigit()]
+    return min(levels) if levels else None
+
+
+def ensure_ac_power(what):
+    """Laptops: don't start long updates, flashing or benchmarks on battery."""
+    if on_ac_power():
+        return
+    if DRY_RUN:
+        say(f"   [dry-run] on battery: a real run asks you to plug in before {what}")
+        return
+    warn(f"this laptop is on battery. Plug in the charger before {what}.")
+    while not on_ac_power():
+        if ask("   Press Enter once it's plugged in (s = continue on battery): ").lower() == "s":
+            warn(f"continuing {what} on battery")
+            return
+    say("   Charger connected.")
+
+
+# ================================================================ stage bookkeeping
 
 def saved_stage():
-    """1, 2, 3, or 4 (= all done). A missing file means a fresh start."""
+    """1-4, or DONE. A missing file means a fresh start."""
     try:
         text = STAGE_FILE.read_text().strip()
     except OSError:
         return 1
-    return int(text) if text in ("1", "2", "3", "4") else 1
+    return int(text) if text.isdigit() and 1 <= int(text) <= DONE else 1
 
 
 def save_stage(n):
     if DRY_RUN:
-        say(f"[dry-run] would record: next stage = {n}")
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STAGE_FILE.write_text(f"{n}\n")
+
+
+def load_options():
+    try:
+        return {o for o in OPTIONS_FILE.read_text().split() if o in OPTIONS}
+    except OSError:
+        return set()
+
+
+def save_options(opts):
+    if DRY_RUN:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OPTIONS_FILE.write_text("".join(f"{o}\n" for o in sorted(opts)))
 
 
 def install_copy():
@@ -765,7 +1132,6 @@ def set_autostart(on):
     """KDE starts everything in ~/.config/autostart at login. The entry opens
     Konsole running this script, which continues from the saved stage."""
     if DRY_RUN:
-        say(f"[dry-run] would {'create' if on else 'remove'} {AUTOSTART}")
         return
     if not on:
         AUTOSTART.unlink(missing_ok=True)
@@ -780,15 +1146,13 @@ X-KDE-autostart-phase=2
 """)
 
 
-def reboot_and_continue(next_stage):
-    """Save progress, set up the autostart, and offer the reboot."""
-    save_stage(next_stage)
+def ask_reboot(what_next):
+    """Offer the reboot; the autostart continues with `what_next` after login."""
     set_autostart(True)
-    say(f"\nStage {next_stage - 1} is finished. After the reboot, log in and stage "
-        f"{next_stage} starts by itself in a Konsole window.")
+    say(f"\nAfter the reboot, log in and {what_next} starts by itself in a Konsole window.")
     say(f"(Or run it yourself any time: python3 {INSTALLED_COPY})")
     if DRY_RUN:
-        say("[dry-run] would ask 'Reboot now? [Y/n]' and on yes run: sudo systemctl reboot")
+        say("   [dry-run] would ask 'Reboot now? [Y/n]' and on yes run: sudo systemctl reboot")
         return
     if yes("Reboot now?"):
         run(["sudo", "systemctl", "reboot"])
@@ -796,7 +1160,7 @@ def reboot_and_continue(next_stage):
         say("Not rebooting yet. Reboot with: sudo systemctl reboot")
 
 
-# ---------------------------------------------------------------- dnf helpers
+# ================================================================ package helpers
 
 def package_available(name):
     """True if dnf can find this package (installed or in an enabled repo).
@@ -815,42 +1179,50 @@ def package_available(name):
 
 def rpm_installed(name):
     if name.startswith("@"):
-        # Group installs are recorded by dnf; also accept the group's key package.
+        # Group installs are recorded by dnf; check the group's key packages.
         return name == "@virtualization" and succeeds(["rpm", "-q", "virt-manager", "qemu-kvm"])
     return succeeds(["rpm", "-q", "--whatprovides", name])
 
 
 def install_packages(names, label):
-    """Install a group of packages. Missing ones are skipped with a warning.
-    If the group transaction fails, retry one by one to isolate the bad one."""
-    say(f"-- {label}")
+    """Install a group of packages. Missing ones are skipped (quietly if
+    optional). If the transaction fails, retry one by one to isolate the bad one."""
     missing = [name for name in names if not rpm_installed(name)]
     if not missing:
-        say("   already installed")
+        say(f"   {label}: already installed")
         return
-    wanted = []
+    wanted_names = []
     for name in missing:
         # A dry run doesn't add the repos, so vendor packages can't be found yet.
         if DRY_RUN or package_available(name):
-            wanted.append(name)
+            wanted_names.append(name)
         elif name in OPTIONAL_RPMS:
-            skipped(f"{name}: optional, not in this Fedora release")
+            skipped(f"{name}: not in this Fedora release's repositories")
         else:
             failed(f"{name}: not found in the enabled repositories")
-    if not wanted:
+    if not wanted_names:
         return
-    if run(["sudo", "dnf", "install", "-y", *wanted]).returncode == 0:
+    say(f"   {label}: installing {', '.join(wanted_names)}")
+    if run(["sudo", "dnf", "install", "-y", *wanted_names]).returncode == 0:
         return
     warn(f"installing '{label}' failed; retrying one package at a time")
-    for name in wanted:
+    for name in wanted_names:
         if run(["sudo", "dnf", "install", "-y", name]).returncode != 0:
             failed(f"install {name}")
 
 
-def swap_package(old, new):
-    """Replace a Fedora package with its RPM Fusion build (or install it)."""
+def swap_package(old, new, what):
+    """Replace a Fedora package with its RPM Fusion build (or just install it)."""
     if rpm_installed(new):
+        say(f"   {new}: already installed")
         return
+    if not DRY_RUN and not package_available(new):
+        if new in OPTIONAL_RPMS:
+            skipped(f"{new}: not in this Fedora release's repositories")
+        else:
+            failed(f"{new}: not found in the enabled repositories")
+        return
+    say(f"   {new}: {what}")
     if rpm_installed(old):
         cmd = ["sudo", "dnf", "swap", "-y", old, new, "--allowerasing"]
     else:
@@ -860,13 +1232,16 @@ def swap_package(old, new):
 
 
 def write_root_file(path, content, mode="644"):
-    """Write a root-owned file via `sudo tee`, only if its content differs."""
+    """Write a root-owned file via `sudo tee`, only if its content differs.
+    Returns True if the file now has this content."""
     try:
         if Path(path).read_text() == content:
-            say(f"{path}: already up to date")
+            say(f"   {path}: already up to date")
             return True
     except OSError:
         pass  # doesn't exist yet (or unreadable): write it
+    if not DRY_RUN:
+        say(f"   writing {path}")
     run(["sudo", "mkdir", "-p", os.path.dirname(path)])
     # tee copies stdin into the file; its own stdout copy is just discarded.
     if run(["sudo", "tee", path], input_text=content).returncode != 0:
@@ -886,7 +1261,7 @@ def write_user_file(path, content, mode=0o644):
     except OSError:
         pass
     if DRY_RUN:
-        say(f"[dry-run] would write {path}")
+        say(f"   [dry-run] would write {path}")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     # Create with the final mode so a private file is never briefly readable.
@@ -894,10 +1269,8 @@ def write_user_file(path, content, mode=0o644):
     with os.fdopen(fd, "w") as f:
         f.write(content)
     os.chmod(path, mode)
-    say(f"wrote {path}")
+    say(f"   wrote {path}")
 
-
-# ------------------------------------------------------------ systemd helpers
 
 def unit_exists(unit, user=False):
     cmd = ["systemctl"] + (["--user"] if user else []) + ["list-unit-files", "--no-legend", unit]
@@ -907,22 +1280,90 @@ def unit_exists(unit, user=False):
 
 def unit_enabled(unit, user=False):
     cmd = ["systemctl"] + (["--user"] if user else []) + ["is-enabled", unit]
-    return output_of(cmd) == "enabled"
+    return output_of(cmd) in ("enabled", "alias")
+
+
+def unit_active(unit):
+    return output_of(["systemctl", "is-active", unit]) == "active"
+
+
+def kread(file, groups, key):
+    cmd = ["kreadconfig6", "--file", file]
+    for g in groups:
+        cmd += ["--group", g]
+    return output_of(cmd + ["--key", key])
+
+
+def kwrite(file, groups, key, value):
+    """Set a KDE config value with kwriteconfig6 (skipped if already set)."""
+    if kread(file, groups, key) == value:
+        return False
+    cmd = ["kwriteconfig6", "--file", file]
+    for g in groups:
+        cmd += ["--group", g]
+    if run(cmd + ["--key", key, value]).returncode != 0:
+        failed(f"set {file} [{']['.join(groups)}] {key}")
+        return False
+    say(f"   {file} [{']['.join(groups)}] {key}={value}")
+    return True
+
+
+# ================================================================ kernel arguments
+
+def norm_args(text):
+    """Kernel arguments with quotes/backslashes removed, for comparisons."""
+    return " " + re.sub(r'[\\"]', "", text) + " "
+
+
+def default_kernel_args():
+    # -n: never prompt (the read-only --check runs without the sudo prompt).
+    out = output_of(["sudo", "-n", "grubby", "--info=DEFAULT"])
+    m = re.search(r'^args="?(.*?)"?$', out, re.M)
+    return m.group(1) if m else ""
+
+
+def ensure_kernel_arg(arg, why):
+    """Add `arg` to every installed kernel (grubby). An existing argument with
+    the same name but another value is replaced. Takes effect after a reboot."""
+    key = arg.split("=", 1)[0]
+    current = norm_args(default_kernel_args())
+    if norm_args(arg).strip() and norm_args(arg) in current:
+        say(f"   {arg}: already set")
+        return
+    say(f"   {arg}: {why}")
+    if re.search(rf"\s{re.escape(key)}=", current):
+        run(["sudo", "grubby", "--update-kernel=ALL", f"--remove-args={key}"])
+    if run(["sudo", "grubby", "--update-kernel=ALL", f"--args={arg}"]).returncode != 0:
+        failed(f"kernel argument {arg}")
+        return
+    FACTS["kernel_args_changed"] = True
+
+
+def expected_kernel_args():
+    """Kernel arguments this machine should have after stage 2."""
+    args = [a for a, tag, _ in KERNEL_ARGS if wanted(tag)]
+    if FACTS.get("amd_pstate_arg"):
+        args.append("amd_pstate=active")
+    return args
 
 
 # ================================================================ stage 1
 
 def stage1_clean_base():
-    step("Stage 1: clean base (system update)")
-    say("A full update on a fresh install can take a while.")
+    run_tasks("Stage 1 of 4: clean base", [
+        ("System update (dnf)", system_update),
+        ("Firmware (fwupd)", firmware_updates),
+        ("Flatpak updates", flatpak_updates),
+    ])
+
+
+def system_update():
+    say("   A full update on a fresh install can take a while.")
     ensure_ac_power("the system update")
     if run(["sudo", "dnf", "upgrade", "--refresh", "-y"]).returncode != 0:
         fatal("`dnf upgrade` failed. Fix networking/repos and rerun.")
-    firmware_updates()
-
-    say("-- Flatpaks that came with the system")
-    if run(["sudo", "flatpak", "update", "-y", "--noninteractive"]).returncode != 0:
-        warn("flatpak update reported a problem (see log); continuing")
+    if not DRY_RUN:
+        say("   System is up to date.")
 
 
 def pending_firmware():
@@ -941,30 +1382,38 @@ def pending_firmware():
 
 def firmware_updates():
     """fwupd updates firmware from the LVFS, where vendors (Framework, Dell,
-    Lenovo, SSD and dock makers, ...) publish it. What it finds depends on the
-    machine, so the pending list is shown before anything is flashed."""
-    step("Firmware (fwupd)")
+    Lenovo, SSD and dock makers, ...) publish it. The pending list is shown and
+    nothing is flashed until you confirm."""
     hw = FACTS["hw"]
     if hw["virt"] != "none":
         skipped(f"firmware: this is a virtual machine ({hw['virt']})")
         return
     # Download the current catalogue first (the one on a fresh install is old).
     run(["sudo", "fwupdmgr", "refresh", "--force"])
-    devices = output_of(["fwupdmgr", "get-devices", "--json"])
+    devices = []
     try:
-        count = sum(1 for d in json.loads(devices).get("Devices", [])
-                    if "updatable" in d.get("Flags", []))
-        say(f"Devices fwupd can update on this {hw['vendor'] or 'machine'}: {count}")
+        devices = json.loads(output_of(["fwupdmgr", "get-devices", "--json"]) or "{}").get("Devices", [])
     except ValueError:
         pass
+    updatable = [d for d in devices if "updatable" in d.get("Flags", [])]
+    say(f"   Devices fwupd can update on this {hw['vendor'] or 'machine'}: {len(updatable)}")
+    if "framework" in BLOCKS:
+        # Many Framework sleep/battery fixes ship as BIOS and EC firmware.
+        for d in devices:
+            if re.search(r"System Firmware|Embedded Controller|\bEC\b", d.get("Name", "")):
+                say(f"   {d.get('Name')}: {d.get('Version', '?')}")
     pending = pending_firmware()
     if not pending:
-        say("No firmware updates pending." + (" (dry run: the catalogue isn't refreshed, so "
-                                              "a real run may find some)" if DRY_RUN else ""))
+        say("   No firmware updates pending." + (" (dry run: the catalogue isn't refreshed, so "
+                                                  "a real run may find some)" if DRY_RUN else ""))
         return
-    say("Pending firmware updates:")
+    say("   Pending firmware updates:")
     for name, cur, new in pending:
-        say(f"  - {name}: {cur} -> {new}")
+        say(f"     - {name}: {cur} -> {new}")
+    if not DRY_RUN and not yes("   Install these firmware updates now?"):
+        TODO.append("Firmware updates: fwupdmgr refresh && fwupdmgr update")
+        skipped("firmware updates (you chose not to install them now)")
+        return
     # fwupd refuses system-firmware updates on battery; check before starting.
     ensure_ac_power("firmware updates")
     # -y: no questions. --no-reboot-check: this script reboots at the end.
@@ -977,24 +1426,55 @@ def firmware_updates():
                      "plugged in and don't power it off while it shows a progress screen.")
 
 
+def flatpak_updates():
+    if run(["sudo", "flatpak", "update", "-y", "--noninteractive"]).returncode != 0:
+        warn("flatpak update reported a problem (see log); continuing")
+    elif not DRY_RUN:
+        say("   Flatpaks are up to date.")
+
+
 # ================================================================ stage 2
 
+def stage2_install():
+    run_tasks("Stage 2 of 4: install (Phase A)", [
+        ("Repositories", setup_repos),
+        ("Video codecs for this GPU (RPM Fusion)", install_swaps),
+        ("Packages", install_rpms),
+        ("Flatpak apps", install_flatpaks),
+        ("Steam extensions", install_steam_extensions),
+        ("AI command-line tools", install_cli_tools),
+        ("Agent SDK environment", install_agent_sdks),
+        ("Shell setup", install_shell_config),
+        ("VS Code extensions", install_vscode_extensions),
+        ("Antigravity", install_antigravity),
+        ("Google Drive mount and Docs offline", setup_google_drive),
+        ("Performance tweaks", performance_tweaks),
+        ("CPU and GPU", cpu_gpu_settings),
+        ("Laptop and Framework", laptop_settings),
+        ("Hibernation (swap file and resume)", hibernate_setup),
+        ("Services, groups and firewall", setup_services),
+        ("Checking everything", lambda: validate(retry=True, post_reboot=False)),
+    ])
+
+
 def setup_repos():
-    step("Repositories")
     rel = FACTS.get("version") or output_of(["rpm", "-E", "%fedora"])
+    # `dnf copr` and `dnf config-manager` are dnf5 plugins.
+    install_packages(["dnf5-plugins"], "dnf plugins")
 
-    say("-- RPM Fusion (free + nonfree)")
-    if not succeeds(["rpm", "-q", "rpmfusion-free-release", "rpmfusion-nonfree-release"]):
-        if run(["sudo", "dnf", "install", "-y", *[u.format(rel=rel) for u in RPMFUSION]]).returncode != 0:
-            failed("enable RPM Fusion")
+    section("RPM Fusion (free + nonfree)")
+    if succeeds(["rpm", "-q", "rpmfusion-free-release", "rpmfusion-nonfree-release"]):
+        say("   already enabled")
+    elif run(["sudo", "dnf", "install", "-y", *[u.format(rel=rel) for u in RPMFUSION]]).returncode != 0:
+        failed("enable RPM Fusion")
 
-    say("-- vendor repos")
+    section("vendor repos (Google, Microsoft, Tailscale, virtio-win)")
     for name, content in REPO_FILES.items():
         write_root_file(f"/etc/yum.repos.d/{name}.repo", content)
     for name, url in REPO_URLS.items():
         path = f"/etc/yum.repos.d/{name}.repo"
         if Path(path).exists():
-            say(f"{path}: already present")
+            say(f"   {path}: already present")
             continue
         r = run(["curl", "-fsSL", url], changes_system=False)
         if r.returncode == 0 and "[" in r.stdout:
@@ -1002,54 +1482,53 @@ def setup_repos():
         else:
             failed(f"download {url}")
 
-    say("-- ChatGPT (its RPM adds OpenAI's signed repo)")
+    section("ChatGPT (its RPM adds OpenAI's signed repo)")
     if rpm_installed("chatgpt"):
         say("   already installed")
     elif run(["sudo", "dnf", "install", "-y", CHATGPT_RPM]).returncode != 0:
         failed("install ChatGPT (adds OpenAI's repo)")
 
-    say("-- COPRs")
-    for copr, what in COPRS.items():
-        say(f"{copr}: {what}")
-        if run(["sudo", "dnf", "copr", "enable", "-y", copr]).returncode != 0:
-            failed(f"enable COPR {copr}")
+    section("COPRs")
+    enabled_repos = output_of(["dnf", "repolist", "--enabled"])
+    for copr, what, tag, only in COPRS:
+        if not wanted(tag):
+            continue
+        repo_id = f"copr:copr.fedorainfracloud.org:{copr.replace('/', ':')}"
+        if repo_id in enabled_repos:
+            say(f"   {copr}: already enabled")
+        else:
+            say(f"   {copr}: {what}")
+            if run(["sudo", "dnf", "copr", "enable", "-y", copr]).returncode != 0:
+                failed(f"enable COPR {copr}")
+                continue
+        if only:
+            # A dnf drop-in (repos.override.d), not an edit of the repo file.
+            run(["sudo", "dnf", "config-manager", "setopt", f"{repo_id}.includepkgs={','.join(only)}"])
 
-    say("-- refreshing package lists")
-    # Vendor repos' signing keys are imported here (first use asks dnf to trust them).
+    section("refreshing package lists")
     if run(["sudo", "dnf", "makecache", "--refresh", "-y"]).returncode != 0:
         failed("dnf makecache")
 
-    say("-- Flathub (for your user)")
+    section("Flathub (for your user)")
     if run(["flatpak", "remote-add", "--user", "--if-not-exists", "flathub", FLATHUB_URL]).returncode != 0:
         failed("add Flathub")
 
 
-def gpu_makers():
-    return [m for m in ("amd", "intel") if m in FACTS["hw"]["gpu_makers"]]
+def install_swaps():
+    todo = [(o, n, w) for o, n, tag, w in SWAPS if wanted(tag)]
+    if not todo:
+        say("   Nothing for this hardware.")
+    for old, new, what in todo:
+        swap_package(old, new, what)
 
 
-def install_codecs():
-    step("Codecs and GPU video drivers (RPM Fusion)")
-    for old, new in CODEC_SWAPS:
-        swap_package(old, new)
-    for maker in gpu_makers():
-        say(f"-- {maker.upper()} GPU")
-        for old, new in GPU_SWAPS.get(maker, []):
-            swap_package(old, new)
-        if GPU_PACKAGES.get(maker):
-            install_packages(GPU_PACKAGES[maker], f"{maker.upper()} GPU compute")
-    install_packages(CODEC_PACKAGES, "GStreamer codecs")
+def rpm_groups():
+    """(label, [names]) for every package group that applies to this machine."""
+    return [(label, [name for name, _ in pkgs]) for label, tag, pkgs in RPM_GROUPS if wanted(tag)]
 
 
 def install_rpms():
-    step("RPM packages")
-    for label, names in RPM_GROUPS.items():
-        install_packages(names, label)
-
-
-def install_vendor_rpms():
-    step("Vendor packages")
-    for label, names in VENDOR_GROUPS.items():
+    for label, names in rpm_groups():
         install_packages(names, label)
 
 
@@ -1059,18 +1538,17 @@ def flatpak_installed(app_id, branch=None):
 
 
 def install_flatpaks():
-    step("Flatpak apps (Flathub, your user)")
-    missing = [a for a in FLATPAKS if not flatpak_installed(a)]
+    apps = [(a, what) for a, what, tag in FLATPAKS if wanted(tag)]
+    missing = [(a, what) for a, what in apps if not flatpak_installed(a)]
     if not missing:
-        say("all installed")
+        say("   All installed.")
         return
-    for app in missing:
-        say(f"-- {FLATPAKS[app]} ({app})")
+    say(f"   Installing: {', '.join(what.split(':')[0] for _, what in missing)}")
     cmd = ["flatpak", "install", "--user", "-y", "--noninteractive", "flathub"]
-    if run(cmd + missing).returncode == 0:
+    if run(cmd + [a for a, _ in missing]).returncode == 0:
         return
     warn("the batch install failed; retrying one app at a time")
-    for app in missing:
+    for app, _ in missing:
         if run(cmd + [app]).returncode != 0:
             failed(f"flatpak {app}")
 
@@ -1083,19 +1561,18 @@ def steam_branch():
 
 
 def install_steam_extensions():
-    step("Steam extensions (MangoHud, gamescope, vkBasalt, OBS capture)")
     branch = steam_branch()
     if not branch:
         if DRY_RUN:
-            say("(dry run: Steam isn't installed yet; a real run reads its runtime branch here)")
+            say("   (dry run: Steam isn't installed yet; a real run reads its runtime branch here)")
         else:
             failed("Steam extensions: Steam isn't installed, so its runtime branch is unknown")
         return
-    say(f"Steam runtime branch: {branch}")
     for ext, label in STEAM_EXTENSIONS.items():
         if flatpak_installed(ext, branch):
+            say(f"   {label}: already installed")
             continue
-        say(f"-- {label}")
+        say(f"   {label}")
         if run(["flatpak", "install", "--user", "-y", "--noninteractive", "flathub",
                 f"{ext}//{branch}"]).returncode != 0:
             failed(f"flatpak {ext}//{branch}")
@@ -1113,25 +1590,24 @@ def have_tool(cmd):
 
 
 def install_cli_tools():
-    step("AI command-line tools (Claude Code, Gemini, Codex, Hugging Face)")
     env = tool_env()
-
-    say("-- Claude Code (Anthropic's installer, updates itself)")
+    section("Claude Code (Anthropic's installer, updates itself)")
     if have_tool("claude"):
         say("   already installed")
     elif run(["bash", "-c", f"set -o pipefail; curl -fsSL {CLAUDE_INSTALLER} | bash"], env=env).returncode != 0:
         failed("install Claude Code")
 
-    say(f"-- npm packages into {NPM_PREFIX} (no sudo)")
+    section(f"Gemini CLI and Codex CLI (npm, into {NPM_PREFIX})")
     run(["npm", "config", "set", "prefix", str(NPM_PREFIX)], env=env)
     missing = [p for p, cmd in NPM_GLOBALS.items() if not have_tool(cmd)]
     for pkg in missing:
+        say(f"   installing {pkg}")
         if run(["npm", "install", "-g", pkg], env=env).returncode != 0:
             failed(f"npm {pkg}")
     if not missing:
         say("   already installed")
 
-    say("-- uv tools")
+    section("Hugging Face CLI (hf)")
     for pkg, cmd in UV_TOOLS.items():
         if have_tool(cmd):
             say(f"   {cmd}: already installed")
@@ -1140,9 +1616,9 @@ def install_cli_tools():
 
 
 def install_agent_sdks():
-    step(f"Agent SDK environment ({AGENTS_VENV})")
     env = tool_env()
     python = AGENTS_VENV / "bin" / "python"
+    say(f"   {AGENTS_VENV}: {', '.join(AGENT_SDKS)}")
     if not python.exists():
         if run(["uv", "venv", "--python", AGENTS_PYTHON, str(AGENTS_VENV)], env=env).returncode != 0:
             failed("create the agent SDK environment")
@@ -1157,7 +1633,6 @@ def install_agent_sdks():
 
 
 def install_shell_config():
-    step("Shell setup (~/.bashrc.d)")
     write_user_file(SHELL_SNIPPET, SHELL_SNIPPET_CONTENT)
     # Fedora's default ~/.bashrc already loads ~/.bashrc.d/*; add it if missing.
     bashrc = HOME / ".bashrc"
@@ -1167,41 +1642,18 @@ def install_shell_config():
         text = ""
     if "bashrc.d" not in text:
         if DRY_RUN:
-            say(f"[dry-run] would add a ~/.bashrc.d loader to {bashrc}")
+            say(f"   [dry-run] would add a ~/.bashrc.d loader to {bashrc}")
         else:
             with open(bashrc, "a") as f:
                 f.write('\nfor rc in ~/.bashrc.d/*; do [ -f "$rc" ] && . "$rc"; done; unset rc\n')
+    say("   `agents` activates the SDK environment in a terminal.")
 
 
 def installed_vscode_extensions():
     return set(output_of(["code", "--list-extensions"]).lower().split())
 
 
-def setup_google_drive():
-    step("Google Drive mount and Google Docs offline")
-    write_user_file(GDRIVE_UNIT_FILE, GDRIVE_UNIT_CONTENT)
-    run(["systemctl", "--user", "daemon-reload"])
-    if gdrive_signed_in():
-        # Already signed in (a re-run): make sure the mount starts with the session.
-        if not unit_enabled(GDRIVE_UNIT, user=True):
-            run(["systemctl", "--user", "enable", "--now", GDRIVE_UNIT])
-    else:
-        say("The mount starts once you sign in to Google Drive (stage 3, or --auth).")
-    write_root_file(CHROME_POLICY, CHROME_POLICY_CONTENT)
-    for key, (name, url, icon) in GOOGLE_APPS.items():
-        write_user_file(HOME / ".local/share/applications" / f"{key}.desktop", f"""\
-[Desktop Entry]
-Type=Application
-Name={name}
-Exec=google-chrome-stable --app={url}
-Icon={icon}
-Terminal=false
-Categories=Office;Network;
-""")
-
-
 def install_vscode_extensions():
-    step("VS Code extensions")
     if not shutil.which("code") and not DRY_RUN:
         failed("VS Code extensions: VS Code isn't installed")
         return
@@ -1209,10 +1661,14 @@ def install_vscode_extensions():
     for ext, label in VSCODE_EXTENSIONS.items():
         if ext.lower() in have:
             continue
-        say(f"-- {label}")
+        say(f"   {label}")
         if run(["code", "--install-extension", ext]).returncode != 0:
             failed(f"VS Code extension {ext}")
+    if all(e.lower() in have for e in VSCODE_EXTENSIONS):
+        say("   All installed.")
 
+
+# ---------------------------------------------------------------- Antigravity
 
 def version_key(v):
     """'2.18.1' -> (2, 18, 1) for comparing versions."""
@@ -1272,11 +1728,10 @@ def antigravity_installed_version(key):
 
 
 def install_antigravity():
-    step("Antigravity (Google)")
     published = antigravity_published()
     for key, p in ANTIGRAVITY.items():
         ver, url = published[key]
-        say(f"-- {p['label']}: Google's download page has {ver}")
+        section(f"{p['label']}: Google's download page has {ver}")
         if p["rpm"]:
             rpm_ver = antigravity_rpm_version(p["rpm"])
             say(f"   Google's RPM repo has {rpm_ver or 'no build'}")
@@ -1315,8 +1770,8 @@ def install_antigravity_tarball(key, ver, url):
     p = ANTIGRAVITY[key]
     dest = ANTIGRAVITY_DIR / key
     if DRY_RUN:
-        say(f"[dry-run] download {url}")
-        say(f"[dry-run] unpack it to {dest}, link {LOCAL_BIN / key}, add a menu entry")
+        say(f"   [dry-run] download {url}")
+        say(f"   [dry-run] unpack it to {dest}, link {LOCAL_BIN / key}, add a menu entry")
         return
     # Unpack next to the destination so the final move is a quick rename.
     ANTIGRAVITY_DIR.mkdir(parents=True, exist_ok=True)
@@ -1369,24 +1824,432 @@ Categories=Development;IDE;
     say(f"   Installed {p['label']} {ver} in {dest}")
 
 
-def gpu_settings():
-    step("GPU settings")
-    gpus = "\n".join(FACTS["hw"]["gpus"])
-    if "[1002:" not in gpus:
-        say("No AMD GPU, so no ROCm overrides are needed.")
-        return
-    if not NAVI_23_24.search(gpus):
-        say("This AMD GPU is supported by ROCm; no override needed.")
-        return
-    say("RX 6600-class GPU (gfx1032/gfx1034): ROCm doesn't support it, so:")
-    say("  - ollama runs it as gfx1030 (same instruction set)")
-    say("  - ramalama uses its Vulkan image instead of ROCm")
-    FACTS["gfx_override"] = True
-    write_root_file(OLLAMA_OVERRIDE, OLLAMA_OVERRIDE_CONTENT)
-    write_root_file(RAMALAMA_CONF, RAMALAMA_CONF_CONTENT)
-    write_root_file(ROCM_PROFILE, ROCM_PROFILE_CONTENT)
-    run(["sudo", "systemctl", "daemon-reload"])
+# ---------------------------------------------------------------- Google Drive
 
+def setup_google_drive():
+    write_user_file(GDRIVE_UNIT_FILE, GDRIVE_UNIT_CONTENT)
+    run(["systemctl", "--user", "daemon-reload"])
+    if gdrive_signed_in():
+        # Already signed in (a re-run): make sure the mount starts with the session.
+        if not unit_enabled(GDRIVE_UNIT, user=True):
+            run(["systemctl", "--user", "enable", "--now", GDRIVE_UNIT])
+    else:
+        say("   The mount starts once you sign in to Google Drive (stage 3, or --auth).")
+    write_root_file(CHROME_POLICY, CHROME_POLICY_CONTENT)
+    for key, (name, url, icon) in GOOGLE_APPS.items():
+        write_user_file(HOME / ".local/share/applications" / f"{key}.desktop", f"""\
+[Desktop Entry]
+Type=Application
+Name={name}
+Exec=google-chrome-stable --app={url}
+Icon={icon}
+Terminal=false
+Categories=Office;Network;
+""")
+
+
+# ---------------------------------------------------------------- performance tweaks
+
+def sysctl_value(name):
+    return output_of(["sysctl", "-n", name])
+
+
+def sysctl_content():
+    lines = [f"# Managed by {SCRIPT}: CachyOS-style tweaks. Delete this file to revert.",
+             "# zram (compressed swap in RAM) is cheap to swap to, so use it more.",
+             "vm.swappiness = 100",
+             "# Keep file system metadata cached longer.",
+             "vm.vfs_cache_pressure = 50",
+             "# Remove the slowdown penalty some games trigger with misaligned memory",
+             "# operations. (\"-\": ignored on CPUs without split-lock detection.)",
+             "-kernel.split_lock_mitigate = 0",
+             "# Google's BBR congestion control: steadier throughput and latency online.",
+             "net.ipv4.tcp_congestion_control = bbr"]
+    current = sysctl_value("vm.max_map_count")
+    if current.isdigit() and int(current) < MAX_MAP_COUNT:
+        lines += [f"# Was {current}; modern games need more memory mappings.",
+                  f"vm.max_map_count = {MAX_MAP_COUNT}"]
+    return "\n".join(lines) + "\n"
+
+
+def fstab_noatime():
+    """Add noatime to every Btrfs mount in /etc/fstab (only the options field
+    changes). A copy of the original is kept once as /etc/fstab.before-postinstall."""
+    try:
+        lines = Path(FSTAB).read_text().splitlines(keepends=True)
+    except OSError:
+        failed(f"read {FSTAB}")
+        return
+    out, changed = [], False
+    for line in lines:
+        fields = line.split()
+        if not line.lstrip().startswith("#") and len(fields) >= 4 and fields[2] == "btrfs":
+            opts = [o for o in fields[3].split(",") if o not in ("relatime", "atime", "strictatime")]
+            if "noatime" not in opts:
+                opts.append("noatime")
+            if opts != fields[3].split(","):
+                line = re.sub(r"^(\s*\S+\s+\S+\s+\S+\s+)(\S+)", lambda m: m.group(1) + ",".join(opts), line)
+                changed = True
+        out.append(line)
+    if not changed:
+        say("   /etc/fstab: Btrfs mounts already use noatime")
+        return
+    if not Path(FSTAB_BACKUP).exists():
+        run(["sudo", "cp", "-a", FSTAB, FSTAB_BACKUP])
+    say("   /etc/fstab: adding noatime to Btrfs mounts (applies after the reboot)")
+    if write_root_file(FSTAB, "".join(out)):
+        run(["sudo", "systemctl", "daemon-reload"])
+
+
+def gamemode_ini(gpu_index=None):
+    text = f"""\
+; Managed by {SCRIPT}. Delete this file to go back to GameMode's defaults.
+[general]
+; ananicy-cpp sets game priority, so GameMode doesn't renice.
+renice=0
+; CPU governor while a game runs (the previous one comes back afterwards).
+desiredgov=performance
+"""
+    if gpu_index is not None:
+        text += f"""
+[gpu]
+; GameMode's required opt-in phrase for changing GPU settings.
+apply_gpu_optimisations=accept-responsibility
+; The AMD GPU: /sys/class/drm/card{gpu_index}
+gpu_device={gpu_index}
+; High GPU clocks only while a game runs.
+amd_performance_level=high
+"""
+    return text
+
+
+def performance_tweaks():
+    section("sysctl (swappiness, cache pressure, split-lock, BBR)")
+    run(["sudo", "modprobe", "tcp_bbr"])
+    write_root_file(BBR_MODULE_FILE, f"# Managed by {SCRIPT}: BBR congestion control.\ntcp_bbr\n")
+    if write_root_file(SYSCTL_FILE, sysctl_content()):
+        run(["sudo", "systemctl", "restart", "systemd-sysctl"])
+
+    section("I/O schedulers (NVMe: none, SSD: mq-deadline, HDD: bfq)")
+    if write_root_file(IOSCHED_RULES_FILE, IOSCHED_RULES):
+        run(["sudo", "udevadm", "control", "--reload"])
+        run(["sudo", "udevadm", "trigger", "--subsystem-match=block", "--action=change"])
+
+    section("Btrfs noatime")
+    fstab_noatime()
+
+    section("ananicy-cpp: your own rules folder (loads after CachyOS's)")
+    write_root_file(f"{ANANICY_CUSTOM_DIR}/README", ANANICY_CUSTOM_README)
+
+    section("GameMode base settings")
+    # Keep a GPU section written by stage 3 when re-running stage 2.
+    current = read_sys(GAMEMODE_INI)
+    if "[gpu]" not in current:
+        write_root_file(GAMEMODE_INI, gamemode_ini())
+    else:
+        say(f"   {GAMEMODE_INI}: already set up (with GPU settings)")
+
+    section("KDE: allow tearing in fullscreen games (lower input latency)")
+    if kwrite(KWINRC[0], KWINRC[1], KWINRC[2], "true"):
+        run(["dbus-send", "--session", "--type=method_call", "--dest=org.kde.KWin",
+             "/KWin", "org.kde.KWin.reconfigure"])
+    else:
+        say("   already on")
+
+
+def cpu_gpu_settings():
+    hw = FACTS["hw"]
+    if "amd-cpu" in BLOCKS:
+        section("AMD CPU: frequency driver")
+        status = read_sys("/sys/devices/system/cpu/amd_pstate/status")
+        if status == "active":
+            say("   amd_pstate is active (the default on Zen 2 and newer)")
+        elif "cppc" in hw["cpu_flags"]:
+            say(f"   amd_pstate is {status or 'not in use'}; switching it to active")
+            FACTS["amd_pstate_arg"] = True
+            ensure_kernel_arg("amd_pstate=active", "AMD's own CPU frequency driver, in active mode")
+        else:
+            say("   this CPU doesn't support amd_pstate; the kernel's default driver stays")
+        if "zenpower" in ENABLED:
+            if rpm_installed("zenpower3"):
+                write_root_file(ZENPOWER_MODPROBE, ZENPOWER_MODPROBE_CONTENT)
+            else:
+                say("   zenpower3 isn't installed, so k10temp stays")
+    if "intel-cpu" in BLOCKS:
+        section("Intel CPU: frequency driver")
+        status = read_sys("/sys/devices/system/cpu/intel_pstate/status")
+        if status == "active":
+            say("   intel_pstate is active (Intel's own driver; works with tuned and GameMode)")
+        else:
+            warn(f"intel_pstate is {status or 'not in use'}; expected 'active' on a modern Intel CPU")
+        if hw["hybrid"]:
+            say("   Hybrid P/E cores: the kernel places work using Intel Thread Director.")
+            say("   (With --with scx, prefer schedulers that know core types, e.g. scx_lavd.)")
+
+    if "amd-gpu" in BLOCKS:
+        section("AMD GPU")
+        if "amd-gpu-tuning" in BLOCKS:
+            for arg, tag, why in KERNEL_ARGS:
+                if tag == "amd-gpu-tuning":
+                    ensure_kernel_arg(arg, why)
+        else:
+            say("   Laptop iGPU: overclock controls stay locked (turn on with --with igpu-overclock)")
+        gpus = "\n".join(output_of(["lspci", "-nn", "-s", c[2]]) for c in hw["cards"] if c[1] == "amdgpu")
+        if NAVI_23_24.search(gpus):
+            say("   RX 6600-class GPU (gfx1032/gfx1034): ROCm doesn't support it, so ollama runs")
+            say("   it as gfx1030 (same instruction set) and ramalama uses its Vulkan image.")
+            write_root_file(OLLAMA_OVERRIDE, OLLAMA_OVERRIDE_CONTENT)
+            write_root_file(RAMALAMA_CONF, RAMALAMA_CONF_CONTENT)
+            write_root_file(ROCM_PROFILE, ROCM_PROFILE_CONTENT)
+            run(["sudo", "systemctl", "daemon-reload"])
+        else:
+            say("   ROCm supports this GPU as-is; no override needed.")
+    if "intel-gpu" in BLOCKS:
+        section("Intel GPU")
+        say("   intel-media-driver (video) and intel_gpu_top (monitoring); nothing else to set.")
+
+
+def laptop_settings():
+    if "laptop" not in BLOCKS:
+        say("   Desktop: tuned-ppd stays at Fedora's defaults; GameMode handles games.")
+        return
+    section("Power profiles (tuned + tuned-ppd, Fedora's standard mapping)")
+    for pkg in ("power-profiles-daemon", "tlp"):
+        if rpm_installed(pkg):
+            warn(f"{pkg} is installed and fights tuned-ppd; remove it: sudo dnf remove {pkg}")
+    say("   KDE's battery applet drives it: Power Saver -> powersave, Balanced -> balanced")
+    say("   (balanced-battery on battery), Performance -> throughput-performance.")
+    if "framework" not in BLOCKS:
+        return
+
+    section("Framework: KDE power profile per state")
+    for state, profile in POWERDEVIL_PROFILES.items():
+        kwrite("powerdevilrc", [state, "Performance"], "PowerProfile", profile)
+    refresh_powerdevil()
+
+    if "framework-intel" in BLOCKS:
+        section("Framework Intel: s2idle fix")
+        for arg, tag, why in KERNEL_ARGS:
+            if tag == "framework-intel":
+                ensure_kernel_arg(arg, why)
+        say("   Revert if wake problems appear: sudo grubby --update-kernel=ALL --remove-args=acpi_osi")
+
+    if "framework-tool" in ENABLED:
+        section("framework_tool (Framework's CLI)")
+        if Path(FRAMEWORK_TOOL).exists():
+            say(f"   {FRAMEWORK_TOOL}: already installed")
+        else:
+            tmp = Path(tempfile.mkdtemp())
+            if run(["curl", "-fsSL", "-o", str(tmp / "framework_tool"), FRAMEWORK_TOOL_URL]).returncode == 0:
+                run(["sudo", "install", "-m", "755", str(tmp / "framework_tool"), FRAMEWORK_TOOL])
+            else:
+                failed("download framework_tool")
+            shutil.rmtree(tmp, ignore_errors=True)
+        say("   e.g. battery charge limit 80%: sudo framework_tool --charge-limit 80")
+    if "audio-no-powersave" in ENABLED:
+        section("Audio power saving off")
+        write_root_file(AUDIO_MODPROBE, AUDIO_MODPROBE_CONTENT)
+
+
+def refresh_powerdevil():
+    run(["dbus-send", "--session", "--type=method_call", "--dest=org.kde.Solid.PowerManagement",
+         "/org/kde/Solid/PowerManagement", "org.kde.Solid.PowerManagement.refreshStatus"])
+
+
+# ---------------------------------------------------------------- hibernation
+
+def secure_boot_on():
+    out = output_of(["mokutil", "--sb-state"]).lower()
+    if out:
+        return "enabled" in out
+    # Without mokutil: the EFI variable's last byte is 1 when Secure Boot is on.
+    for var in Path("/sys/firmware/efi/efivars").glob("SecureBoot-*"):
+        try:
+            return var.read_bytes()[-1:] == b"\x01"
+        except OSError:
+            pass
+    return False
+
+
+def swap_in_fstab():
+    return any(l.split()[:1] == [str(SWAP_FILE)] for l in read_sys(FSTAB).splitlines())
+
+
+def logind_lid_content():
+    return f"""\
+# Managed by {SCRIPT}. Closing the lid = lowest-drain state. KDE's own lid
+# setting (powerdevilrc) says the same, for when you're logged in.
+[Login]
+HandleLidSwitch={LID_ACTION}
+HandleLidSwitchExternalPower={LID_ACTION}
+HandleLidSwitchDocked=ignore
+"""
+
+
+def kde_lid_done():
+    lid, mode = KDE_LID[LID_ACTION]
+    return all(kread("powerdevilrc", [s, "SuspendAndShutdown"], "LidAction") == lid
+               and (mode is None or kread("powerdevilrc", [s, "SuspendAndShutdown"], "SleepMode") == mode)
+               for s in ("AC", "Battery", "LowBattery"))
+
+
+def hibernate_state():
+    """n/a, secure-boot, needs-setup, needs-reboot, needs-lid or done."""
+    if "hibernate" not in BLOCKS:
+        return "n/a"
+    if secure_boot_on():
+        return "secure-boot"
+    args = norm_args(default_kernel_args())
+    if not (SWAP_FILE.exists() and swap_in_fstab() and " resume_offset=" in args
+            and Path(DRACUT_RESUME).exists()):
+        return "needs-setup"
+    if "resume_offset=" not in read_sys("/proc/cmdline"):
+        return "needs-reboot"
+    if read_sys(LOGIND_LID) != logind_lid_content() or not kde_lid_done():
+        return "needs-lid"
+    return "done"
+
+
+def secure_boot_message():
+    say("   Secure Boot is on. Kernel lockdown (part of Secure Boot) blocks writing a")
+    say("   hibernation image, so lid close stays at normal sleep for now.")
+    say("   To get hibernate: reboot into the Framework BIOS (F2), turn Secure Boot off,")
+    say(f"   then run python3 {INSTALLED_COPY} again; it picks this step up.")
+    TODO.append("Hibernate: turn Secure Boot off in the Framework BIOS (F2), then run "
+                f"python3 {INSTALLED_COPY} again.")
+
+
+def hibernate_setup():
+    """Phase A: swap file (own Btrfs subvolume, SELinux label, fstab), resume
+    kernel arguments and boot image. Takes effect after the reboot."""
+    state = hibernate_state()
+    if state == "n/a":
+        say("   Not a Framework laptop: hibernation isn't set up.")
+        return
+    if state == "secure-boot":
+        secure_boot_message()
+        return
+    if state != "needs-setup":
+        say("   Swap file and resume settings are already in place.")
+        return
+    if output_of(["findmnt", "-no", "FSTYPE", "/"]) != "btrfs":
+        skipped("hibernation: / isn't Btrfs")
+        return
+    mem_kib = int(re.search(r"MemTotal:\s+(\d+)", read_sys("/proc/meminfo")).group(1))
+    size_gib = math.ceil(mem_kib / 1024 / 1024)
+    free_gib = shutil.disk_usage("/").free / 1024 ** 3
+    if not SWAP_FILE.exists() and free_gib < size_gib + 10:
+        skipped(f"hibernation: needs {size_gib} GiB for the swap file (+10 GiB spare), "
+                f"only {free_gib:.0f} GiB free")
+        return
+    say(f"   Swap file of {size_gib} GiB (= RAM) for hibernation; zram still handles everyday swap.")
+    if not SWAP_SUBVOL.exists():
+        run(["sudo", "btrfs", "subvolume", "create", str(SWAP_SUBVOL)])
+    if not SWAP_FILE.exists():
+        # mkswapfile creates it with copy-on-write off, which Btrfs swap files need.
+        if run(["sudo", "btrfs", "filesystem", "mkswapfile", "--size", f"{size_gib}g",
+                str(SWAP_FILE)]).returncode != 0:
+            failed("create the hibernation swap file")
+            return
+    section("SELinux label for the swap file")
+    if "/swap(/.*)?" not in output_of(["sudo", "semanage", "fcontext", "-l", "-C"]):
+        run(["sudo", "semanage", "fcontext", "-a", "-t", "swapfile_t", "/swap(/.*)?"])
+    run(["sudo", "restorecon", "-RF", str(SWAP_SUBVOL)])
+    section("fstab entry (low priority, after zram)")
+    if not swap_in_fstab():
+        if not Path(FSTAB_BACKUP).exists():
+            run(["sudo", "cp", "-a", FSTAB, FSTAB_BACKUP])
+        text = read_sys(FSTAB) + "\n" + f"# Hibernation swap file (managed by {SCRIPT})\n" + SWAP_FSTAB_LINE + "\n"
+        write_root_file(FSTAB, text)
+        run(["sudo", "systemctl", "daemon-reload"])
+    if str(SWAP_FILE) not in read_sys("/proc/swaps"):
+        run(["sudo", "swapon", "--priority", "0", str(SWAP_FILE)])
+    section("resume kernel arguments")
+    uuid = output_of(["findmnt", "-no", "UUID", "-T", str(SWAP_FILE)])
+    offset = output_of(["sudo", "btrfs", "inspect-internal", "map-swapfile", "-r", str(SWAP_FILE)])
+    if DRY_RUN and not (uuid and offset):
+        uuid, offset = uuid or "<filesystem UUID>", offset or "<offset>"
+    if not (uuid and offset):
+        failed("hibernation: couldn't read the swap file's location")
+        return
+    ensure_kernel_arg(f"resume=UUID={uuid}", "where the hibernation image lives")
+    ensure_kernel_arg(f"resume_offset={offset}", "its position inside the Btrfs file system")
+    section("boot image with the resume module (dracut; takes a few minutes)")
+    write_root_file(DRACUT_RESUME, DRACUT_RESUME_CONTENT)
+    if run(["sudo", "dracut", "-f", "--regenerate-all"]).returncode != 0:
+        failed("rebuild the boot image (dracut)")
+    write_root_file(SLEEP_CONF, SLEEP_CONF_CONTENT)
+    say("   Hibernation is ready after the reboot. Stage 3 sets the lid action and offers a test.")
+    NOTES.append("The hibernation image is a copy of RAM on disk; it's only encrypted if the "
+                 "disk is (LUKS).")
+
+
+def can_hibernate():
+    out = output_of(["busctl", "call", "org.freedesktop.login1", "/org/freedesktop/login1",
+                     "org.freedesktop.login1.Manager", "CanHibernate"])
+    return '"yes"' in out
+
+
+def hibernate_finish():
+    """Phase B: lid action (systemd + KDE), then an optional test."""
+    state = hibernate_state()
+    if state == "n/a":
+        say("   Not a Framework laptop: nothing to do.")
+        return
+    if state == "secure-boot":
+        secure_boot_message()
+        return
+    if DRY_RUN and state in ("needs-setup", "needs-reboot"):
+        say("   (dry run: stage 2 and the reboot would be done by now; previewing the lid step)")
+        state = "needs-lid"
+    if state == "needs-setup":
+        hibernate_setup()
+        FACTS["reboot_for_hibernate"] = True
+        return
+    if state == "needs-reboot":
+        say("   The resume settings take effect after a reboot; this step runs then.")
+        FACTS["reboot_for_hibernate"] = True
+        return
+    section(f"Lid close: {LID_ACTION}")
+    write_root_file(LOGIND_LID, logind_lid_content())
+    run(["sudo", "systemctl", "kill", "-s", "HUP", "systemd-logind"])
+    lid, mode = KDE_LID[LID_ACTION]
+    for s in ("AC", "Battery", "LowBattery"):
+        kwrite("powerdevilrc", [s, "SuspendAndShutdown"], "LidAction", lid)
+        if mode:
+            kwrite("powerdevilrc", [s, "SuspendAndShutdown"], "SleepMode", mode)
+    refresh_powerdevil()
+    if not DRY_RUN and not can_hibernate():
+        warn("the system doesn't report hibernation as possible yet (logind CanHibernate != yes)")
+        TODO.append("Hibernate: check `swapon --show` lists /swap/swapfile and /proc/cmdline has "
+                    "resume_offset=, then run this script again.")
+        return
+    section("Test hibernate")
+    if DRY_RUN:
+        say("   [dry-run] would offer: systemctl hibernate, then check the journal")
+        return
+    say("   Save your work first. The laptop powers off; press the power button to resume,")
+    say("   and this window continues where it was.")
+    if not yes("   Hibernate now to test?", default=False):
+        TODO.append("Hibernate test: save work, `systemctl hibernate`, power on, then "
+                    "`journalctl -b -g 'hibernat|resum'`.")
+        return
+    started = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    interactive(["systemctl", "hibernate"])
+    ask("   Press Enter once the laptop has resumed: ")
+    lines = output_of(["journalctl", "-b", "--since", started, "-g", "hibernat|resum|PM: Image"])
+    for line in lines.splitlines()[-8:]:
+        say(f"     {line}")
+    denials = output_of(["journalctl", "-b", "--since", started, "-g", "avc:.*swapfile"])
+    if denials:
+        warn("SELinux blocked something around the swap file:")
+        for line in denials.splitlines()[-4:]:
+            say(f"     {line}")
+    else:
+        say("   No SELinux denials for the swap file.")
+
+
+# ---------------------------------------------------------------- services
 
 def user_in_group(group):
     try:
@@ -1396,18 +2259,21 @@ def user_in_group(group):
 
 
 def setup_services():
-    step("Services, groups and firewall")
-    for unit in SYSTEM_SERVICES:
-        if unit_enabled(unit):
-            say(f"{unit}: already enabled")
+    for unit, tag in SYSTEM_SERVICES:
+        if not wanted(tag):
+            continue
+        if unit_enabled(unit) and (DRY_RUN or unit_active(unit)):
+            say(f"   {unit}: running")
         elif unit_exists(unit) or DRY_RUN:
             if run(["sudo", "systemctl", "enable", "--now", unit]).returncode != 0:
                 failed(f"enable {unit}")
+            elif not DRY_RUN:
+                say(f"   {unit}: enabled")
         else:
             failed(f"enable {unit}: not installed")
     for unit in USER_SERVICES:
         if unit_enabled(unit, user=True):
-            say(f"{unit} (user): already enabled")
+            say(f"   {unit} (user): enabled")
         elif unit_exists(unit, user=True) or DRY_RUN:
             # Starts with your desktop session from the next login on.
             if run(["systemctl", "--user", "enable", unit]).returncode != 0:
@@ -1420,66 +2286,50 @@ def setup_services():
         try:
             grp.getgrnam(group)
         except KeyError:
-            if not DRY_RUN:
-                warn(f"group {group} doesn't exist; skipping")
             continue
         if user_in_group(group):
             continue
+        say(f"   adding {me} to {group} (takes effect after the reboot)")
         if run(["sudo", "usermod", "-aG", group, me]).returncode != 0:
             failed(f"add {me} to {group}")
 
     if not succeeds(["systemctl", "is-active", "--quiet", "firewalld"]):
-        say("firewalld isn't running; no ports to open")
+        say("   firewalld isn't running; no ports to open")
         return
     zone = output_of(["firewall-cmd", "--get-default-zone"])
     if not zone:
         failed("firewall: couldn't read the default zone")
         return
+    have = output_of(["sudo", "firewall-cmd", "--permanent", f"--zone={zone}", "--list-ports"]).split()
     for what, ports in STREAMING_PORTS.items():
-        say(f"-- firewall ({zone}): {what}")
-        for port in ports:
-            run(["sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--add-port={port}"])
+        new = [p for p in ports if p not in have]
+        if new:
+            say(f"   firewall ({zone}): {what} {' '.join(new)}")
+            for port in new:
+                run(["sudo", "firewall-cmd", "--permanent", f"--zone={zone}", f"--add-port={port}"])
     run(["sudo", "firewall-cmd", "--reload"])
 
 
-def stage2_install():
-    step("Stage 2: install")
-    setup_repos()
-    install_codecs()
-    install_rpms()
-    install_vendor_rpms()
-    install_flatpaks()
-    install_steam_extensions()
-    install_cli_tools()
-    install_agent_sdks()
-    install_shell_config()
-    install_vscode_extensions()
-    install_antigravity()
-    setup_google_drive()
-    gpu_settings()
-    setup_services()
+# ================================================================ validation
 
-
-# ------------------------------------------------------------ validation
-
-def collect_checks():
-    """Every item stage 2 installs, as (area, item, ok). Read-only."""
+def collect_checks(post_reboot):
+    """Every item stage 2 installs, as (area, item, ok). Read-only.
+    post_reboot adds checks that only pass once the reboot made them live."""
     rows = []
-    for label, names in {**RPM_GROUPS, **VENDOR_GROUPS}.items():
-        for name in names:
-            if name in OPTIONAL_RPMS:
+    for label, tag, pkgs in RPM_GROUPS:
+        if not wanted(tag):
+            continue
+        for name, _ in pkgs:
+            if name in OPTIONAL_RPMS and not rpm_installed(name):
                 continue
             rows.append(("rpm", f"{name} ({label})", rpm_installed(name)))
-    for old, new in CODEC_SWAPS + [sw for m in gpu_makers() for sw in GPU_SWAPS.get(m, [])]:
-        rows.append(("codecs", new, rpm_installed(new)))
-    for m in gpu_makers():
-        for name in GPU_PACKAGES.get(m, []):
-            rows.append(("codecs", name, rpm_installed(name)))
-    for name in CODEC_PACKAGES:
-        rows.append(("codecs", name, rpm_installed(name)))
+    for old, new, tag, _ in SWAPS:
+        if wanted(tag) and not (new in OPTIONAL_RPMS and not rpm_installed(new)):
+            rows.append(("codecs", new, rpm_installed(new)))
 
-    for app, label in FLATPAKS.items():
-        rows.append(("flatpak", label, flatpak_installed(app)))
+    for app, what, tag in FLATPAKS:
+        if wanted(tag):
+            rows.append(("flatpak", what.split(":")[0], flatpak_installed(app)))
     branch = steam_branch()
     for ext, label in STEAM_EXTENSIONS.items():
         rows.append(("steam-ext", label, bool(branch) and flatpak_installed(ext, branch)))
@@ -1502,40 +2352,95 @@ def collect_checks():
 
     published = antigravity_published()
     for key, p in ANTIGRAVITY.items():
-        have = antigravity_installed_version(key)
+        have_ver = antigravity_installed_version(key)
         want = published[key][0]  # current version on Google's download page
-        ok = bool(have) and version_key(have) >= version_key(want)
-        rows.append(("antigravity", f"{p['label']} {want}", ok))
+        rows.append(("antigravity", f"{p['label']} {want}",
+                     bool(have_ver) and version_key(have_ver) >= version_key(want)))
 
-    for unit in SYSTEM_SERVICES:
-        rows.append(("service", unit, unit_enabled(unit)))
-    for unit in USER_SERVICES:
-        rows.append(("service", f"{unit} (user)", unit_enabled(unit, user=True)))
-    for group in GROUPS:
-        rows.append(("group", group, user_in_group(group)))
-    rows.append(("shell", "~/.bashrc.d snippet", SHELL_SNIPPET.exists()))
     rows.append(("google", "Drive mount service file", GDRIVE_UNIT_FILE.exists()))
     rows.append(("google", "Docs Offline extension policy", Path(CHROME_POLICY).exists()))
     for key, (name, _, _) in GOOGLE_APPS.items():
         rows.append(("google", f"{name} menu entry",
                      (HOME / ".local/share/applications" / f"{key}.desktop").exists()))
+
+    rows.append(("tweaks", SYSCTL_FILE, Path(SYSCTL_FILE).exists()))
+    rows.append(("tweaks", IOSCHED_RULES_FILE, Path(IOSCHED_RULES_FILE).exists()))
+    rows.append(("tweaks", "noatime on Btrfs mounts", all(
+        "noatime" in l.split()[3] for l in read_sys(FSTAB).splitlines()
+        if not l.lstrip().startswith("#") and len(l.split()) >= 4 and l.split()[2] == "btrfs")))
+    rows.append(("tweaks", f"{ANANICY_CUSTOM_DIR}/", Path(ANANICY_CUSTOM_DIR).is_dir()))
+    rows.append(("tweaks", GAMEMODE_INI, Path(GAMEMODE_INI).exists()))
+    rows.append(("tweaks", "KDE: allow tearing", kread(*KWINRC) in ("true", "")))
+    for arg in expected_kernel_args():
+        rows.append(("kernel", f"{arg} (configured)", norm_args(arg) in norm_args(default_kernel_args())))
+
+    for unit, tag in SYSTEM_SERVICES:
+        if wanted(tag):
+            rows.append(("service", f"{unit} enabled", unit_enabled(unit)))
+    for unit in USER_SERVICES:
+        rows.append(("service", f"{unit} (user) enabled", unit_enabled(unit, user=True)))
+    for group in GROUPS:
+        try:
+            grp.getgrnam(group)
+        except KeyError:
+            continue
+        rows.append(("group", group, user_in_group(group)))
+    rows.append(("shell", "~/.bashrc.d snippet", SHELL_SNIPPET.exists()))
+
+    if post_reboot:
+        rows += verify_checks()
+    return rows
+
+
+def verify_checks():
+    """Is it live? (kernel arguments, daemons, sysctl, drivers, sleep). Read-only."""
+    rows = []
+    cmdline = norm_args(read_sys("/proc/cmdline"))
+    for arg in expected_kernel_args():
+        rows.append(("live", f"{arg} active", norm_args(arg) in cmdline))
+    if "amd-cpu" in BLOCKS and read_sys("/sys/devices/system/cpu/amd_pstate/status"):
+        rows.append(("live", "amd_pstate active", read_sys("/sys/devices/system/cpu/amd_pstate/status") == "active"))
+    if "intel-cpu" in BLOCKS:
+        rows.append(("live", "intel_pstate active", read_sys("/sys/devices/system/cpu/intel_pstate/status") == "active"))
+    for unit, tag in SYSTEM_SERVICES:
+        if wanted(tag) and unit in ("ananicy-cpp.service", "tuned.service", "tuned-ppd.service", "lactd.service"):
+            rows.append(("live", f"{unit} running", unit_active(unit)))
+    rows.append(("live", "swappiness 100", sysctl_value("vm.swappiness") == "100"))
+    rows.append(("live", "TCP congestion control bbr", sysctl_value("net.ipv4.tcp_congestion_control") == "bbr"))
+    for dev in sorted(Path("/sys/block").glob("nvme*n*")):
+        rows.append(("live", f"{dev.name} I/O scheduler none", "[none]" in read_sys(dev / "queue/scheduler")))
+    if BLOCKS & {"amd-gpu", "intel-gpu"}:
+        rows.append(("live", "hardware video (vainfo)", succeeds(["vainfo", "--display", "drm"])))
+    if "amd-gpu" in BLOCKS:
+        rows.append(("live", "GameMode AMD GPU settings", "[gpu]" in read_sys(GAMEMODE_INI)))
+    rows.append(("live", "Phoronix Test Suite configured (no upload)", pts_configured()))
+    if "laptop" in BLOCKS:
+        rows.append(("live", "sleep mode s2idle", "[s2idle]" in read_sys("/sys/power/mem_sleep")))
+    if "hibernate" in BLOCKS:
+        rows.append(("live", "Secure Boot off (needed for hibernate)", not secure_boot_on()))
+        rows.append(("live", "resume= / resume_offset= active", "resume_offset=" in read_sys("/proc/cmdline")))
+        rows.append(("live", "hibernation swap file active", str(SWAP_FILE) in read_sys("/proc/swaps")))
+        rows.append(("live", "hibernate possible (logind)", can_hibernate()))
+        rows.append(("live", f"lid close = {LID_ACTION}", hibernate_state() == "done"))
     return rows
 
 
 # What to re-run when an area has failures.
 RETRY = {
-    "rpm": lambda: (install_rpms(), install_vendor_rpms()),
-    "codecs": install_codecs,
+    "rpm": install_rpms,
+    "codecs": install_swaps,
     "flatpak": install_flatpaks,
     "steam-ext": install_steam_extensions,
     "cli": install_cli_tools,
     "sdk": install_agent_sdks,
     "vscode": install_vscode_extensions,
-    "antigravity": lambda: install_antigravity(),
+    "antigravity": install_antigravity,
+    "google": setup_google_drive,
+    "tweaks": performance_tweaks,
+    "kernel": cpu_gpu_settings,
     "service": setup_services,
     "group": setup_services,
     "shell": install_shell_config,
-    "google": setup_google_drive,
 }
 
 
@@ -1546,29 +2451,29 @@ def print_table(rows, retried=()):
             mark = "FIXED" if (area, item) in retried else "ok"
         else:
             mark = "FAILED"
-        say(f"  {area:<12} {item:<{width}}  {mark}")
+        say(f"   {area:<12} {item:<{width}}  {mark}")
 
 
-def validate(retry=True):
-    step("Validation")
-    rows = collect_checks()
+def validate(retry=True, post_reboot=False):
+    rows = collect_checks(post_reboot)
     bad = [(a, i) for a, i, ok in rows if not ok]
     if bad and retry and not DRY_RUN:
-        areas = sorted({a for a, _ in bad})
-        say(f"{len(bad)} item(s) missing; retrying once: {', '.join(areas)}")
-        done = set()
-        for area in areas:
-            fix = RETRY[area]
-            if fix not in done:
-                fix()
-                done.add(fix)
-        rows = collect_checks()
+        areas = sorted({a for a, _ in bad if a in RETRY})
+        if areas:
+            say(f"   {len(bad)} item(s) missing; retrying once: {', '.join(areas)}")
+            done = set()
+            for area in areas:
+                fix = RETRY[area]
+                if fix not in done:
+                    fix()
+                    done.add(fix)
+            rows = collect_checks(post_reboot)
     elif bad and DRY_RUN:
-        say("(dry run: nothing is installed yet, so most checks below fail; a real run retries these)")
-    step("Validation results")
+        say("   (dry run: nothing is installed yet, so most checks below fail)")
+    section("Results")
     print_table(rows, retried=set(bad))
     still_bad = [f"{a}: {i}" for a, i, ok in rows if not ok]
-    say(f"\n{len(rows) - len(still_bad)} of {len(rows)} OK")
+    say(f"\n   {len(rows) - len(still_bad)} of {len(rows)} OK")
     if still_bad and not DRY_RUN:
         for item in still_bad:
             failed(f"check {item}")
@@ -1577,11 +2482,110 @@ def validate(retry=True):
 
 # ================================================================ stage 3
 
+def stage3_configure():
+    run_tasks("Stage 3 of 4: configure (Phase B) and sign in", [
+        ("Post-reboot checks", post_reboot_checks),
+        ("GameMode GPU settings", gamemode_gpu),
+        ("Displays: variable refresh rate", displays_vrr),
+        ("Benchmark tools (Phoronix Test Suite, MangoHud logging)", benchmark_tools_setup),
+        ("Hibernation: lid action and test", hibernate_finish),
+        ("Sign-ins", signins),
+        ("API keys for the agent SDKs", api_keys),
+        ("Apps that need a sign-in", open_apps),
+        ("To-do list", write_todo),
+    ])
+
+
+def post_reboot_checks():
+    rows = verify_checks()
+    print_table(rows)
+    bad = [i for _, i, ok in rows if not ok]
+    if bad and not DRY_RUN:
+        NOTES.append("Not live yet: " + "; ".join(bad) + ". See the log, or run --check.")
+
+
+def amd_gpu_index():
+    """The AMD GPU GameMode should drive: the amdgpu card with the most VRAM
+    (the graphics card, not a CPU's iGPU)."""
+    cards = [c for c in FACTS["hw"]["cards"] if c[1] == "amdgpu"]
+    return max(cards, key=lambda c: c[3])[0] if cards else None
+
+
+def gamemode_gpu():
+    if "amd-gpu" not in BLOCKS:
+        say("   No AMD GPU: GameMode's GPU settings are AMD-only; skipped.")
+        return
+    index = amd_gpu_index()
+    say(f"   GPU for GameMode: card{index} (high clocks only while a game runs)")
+    write_root_file(GAMEMODE_INI, gamemode_ini(index))
+
+
+def displays_vrr():
+    """KDE Wayland: adaptive sync (VRR) = Automatic (on for fullscreen games)."""
+    try:
+        outputs = json.loads(output_of(["kscreen-doctor", "-j"]) or "{}").get("outputs", [])
+    except ValueError:
+        outputs = []
+    if not outputs:
+        say("   Couldn't read the displays (needs a running Plasma session); skipped.")
+        return
+    for o in outputs:
+        if not (o.get("connected") and o.get("enabled")):
+            continue
+        name = o.get("name", "?")
+        if str(o.get("vrrPolicy", "")).lower() in ("2", "automatic"):
+            say(f"   {name}: adaptive sync already automatic")
+            continue
+        say(f"   {name}: adaptive sync -> automatic")
+        run(["kscreen-doctor", f"output.{name}.vrrpolicy.automatic"])
+    say(f"   Allow tearing in fullscreen: {kread(*KWINRC) or 'true (default)'}")
+
+
+def machine_id():
+    mid = read_sys("/etc/machine-id")[:8] or "unknown"
+    return f"{socket.gethostname().split('.')[0]}-{mid}"
+
+
+def pts_configured():
+    text = read_sys(PTS_CONFIG)
+    return "<UploadResults>FALSE</UploadResults>" in text and "<Configured>TRUE</Configured>" in text
+
+
+def benchmark_tools_setup():
+    section("Phoronix Test Suite: unattended, results kept local, no upload")
+    if pts_configured():
+        say("   already configured")
+    else:
+        # enterprise-setup: accepts the terms once, anonymous reporting off.
+        run(["phoronix-test-suite", "enterprise-setup"])
+        run(["phoronix-test-suite", "user-config-set", *PTS_SETTINGS])
+    section("MangoHud logging")
+    logs = BENCH_ROOT / machine_id() / "mangohud"
+    if MANGOHUD_CONF.exists():
+        say(f"   {MANGOHUD_CONF} already exists; left as is")
+    else:
+        write_user_file(MANGOHUD_CONF, f"""\
+# Written by {SCRIPT} (only because there was none). Edit freely.
+# Shift_L+F2 starts/stops a CSV log of frame times, FPS, loads, clocks and temps.
+# For a timed run: MANGOHUD_CONFIG=autostart_log=1,log_duration=60 mangohud %command%
+output_folder={logs}
+toggle_logging=Shift_L+F2
+""")
+    if not DRY_RUN:
+        logs.mkdir(parents=True, exist_ok=True)
+    # Flatpak Steam's MangoHud can only write where the sandbox allows.
+    if flatpak_installed("com.valvesoftware.Steam"):
+        run(["flatpak", "override", "--user", f"--filesystem={BENCH_ROOT}", "com.valvesoftware.Steam"])
+    say(f"   Logs go to {logs}")
+
+
+# ---------------------------------------------------------------- sign-ins
+
 def signin(title, is_done, action, todo_text):
     """One sign-in: skip if already done, else offer to run it now."""
-    say(f"\n-- {title}")
+    section(title)
     if DRY_RUN:
-        say(f"[dry-run] if not already done, would offer to run: {todo_text}")
+        say(f"   [dry-run] if not already done, would offer to run: {todo_text}")
         return
     if is_done():
         say("   already done")
@@ -1597,7 +2601,7 @@ def signin(title, is_done, action, todo_text):
 
 def open_url(url):
     if DRY_RUN:
-        say(f"[dry-run] xdg-open {url}")
+        say(f"   [dry-run] xdg-open {url}")
         return
     subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
@@ -1703,6 +2707,33 @@ def gdrive_login():
         say(f"   Google Drive is at {GDRIVE_DIR} (drag it to Dolphin's Places panel for quick access).")
 
 
+def signins():
+    say("   Each item is checked first; finished ones are skipped. Answer n to skip one.")
+    signin("Git name and email",
+           lambda: bool(output_of(["git", "config", "--global", "user.email"])),
+           git_identity,
+           'git config --global user.name "..." ; git config --global user.email "..."')
+    signin("SSH key", SSH_KEY.exists, ssh_key,
+           "SSH key: ssh-keygen -t ed25519")
+    signin("GitHub (gh)", lambda: succeeds(["gh", "auth", "status"]), gh_login,
+           "gh auth login --git-protocol ssh --web")
+    signin("Google Cloud (gcloud)", lambda: bool(gcloud_account()), gcloud_login,
+           "gcloud auth login")
+    signin("Google Cloud credentials for SDKs (ADC)", ADC_FILE.exists, gcloud_adc,
+           "gcloud auth application-default login")
+    signin("Claude Code", lambda: succeeds([claude_cmd(), "auth", "status"]), claude_login,
+           "claude auth login")
+    signin("Gemini CLI", GEMINI_CREDS.exists, gemini_login, "Gemini CLI: run `gemini` and log in with Google")
+    signin("Codex CLI", lambda: succeeds(["codex", "login", "status"]), codex_login, "codex login")
+    signin("Hugging Face", lambda: succeeds(["hf", "auth", "whoami"]), hf_login, "hf auth login")
+    signin("Google Drive mount (~/GoogleDrive)",
+           lambda: gdrive_signed_in() and unit_enabled(GDRIVE_UNIT, user=True), gdrive_login,
+           f"Google Drive mount: python3 {INSTALLED_COPY} --auth (or rclone config create "
+           f"{GDRIVE_REMOTE} drive, then systemctl --user enable --now {GDRIVE_UNIT})")
+    signin("Tailscale", lambda: succeeds(["tailscale", "status"]), tailscale_login,
+           f"sudo tailscale up --operator={username()}")
+
+
 def read_api_keys():
     keys = {}
     try:
@@ -1716,17 +2747,16 @@ def read_api_keys():
 
 
 def api_keys():
-    step("API keys for the agent SDKs")
-    say(f"Saved to {API_KEYS_FILE} (only you can read it) and loaded only when you run")
-    say("`agents` in a terminal, so they never override the CLIs' subscription logins.")
+    say(f"   Saved to {API_KEYS_FILE} (only you can read it) and loaded only when you run")
+    say("   `agents` in a terminal, so they never override the CLIs' subscription logins.")
     keys = read_api_keys()
     changed = False
     for var, page in API_KEYS.items():
         if var in keys:
-            say(f"-- {var}: already saved")
+            section(f"{var}: already saved")
             continue
         if DRY_RUN:
-            say(f"[dry-run] would offer to open {page} and ask for {var} (hidden input)")
+            say(f"   [dry-run] would offer to open {page} and ask for {var} (hidden input)")
             continue
         if not yes(f"-- Add {var}?", default=False):
             TODO.append(f"(optional) API key: create one at {page}, then add {var}=... to {API_KEYS_FILE}")
@@ -1763,13 +2793,12 @@ def find_desktop_file(ids, label):
 
 
 def open_apps():
-    step("Apps that need a sign-in")
-    say("Each app opens in turn. Sign in, then come back here and press Enter.")
-    say("Type s then Enter to skip one (it goes on the to-do list).")
+    say("   Each app opens in turn. Sign in, then come back here and press Enter.")
+    say("   Type s then Enter to skip one (it goes on the to-do list).")
     for label, ids, what in SIGNIN_APPS:
-        say(f"\n-- {label}: {what}")
+        section(f"{label}: {what}")
         if DRY_RUN:
-            say(f"[dry-run] would open {label} and wait for Enter")
+            say(f"   [dry-run] would open {label} and wait for Enter")
             continue
         if ask("   Enter = open it, s = skip: ").lower() == "s":
             TODO.append(f"{label}: {what}")
@@ -1784,7 +2813,7 @@ def open_apps():
         if ask("   Press Enter when done (s = not finished, add to to-do): ").lower() == "s":
             TODO.append(f"{label}: {what}")
 
-    say(f"\n-- Sunshine: create its admin username and password at {SUNSHINE_WEB_UI}")
+    section(f"Sunshine: create its admin username and password at {SUNSHINE_WEB_UI}")
     say("   (Your browser warns about the certificate: it's Sunshine's own, on this PC; continue.)")
     if DRY_RUN or yes("   Open it now?"):
         open_url(SUNSHINE_WEB_UI)
@@ -1797,45 +2826,88 @@ def write_todo():
     text = "Desktop post-install: things left to do\n" + "=" * 40 + "\n"
     text += "".join(f"[ ] {item}\n" for item in items)
     text += f"\nSign-ins again any time: python3 {INSTALLED_COPY} --auth\n"
+    text += f"Baseline benchmarks any time: python3 {INSTALLED_COPY} --benchmark\n"
     write_user_file(TODO_FILE, text)
+    say(f"   {TODO_FILE}")
 
 
-def stage3_signin():
-    step("Stage 3: sign-ins")
-    say("Each item is checked first; finished ones are skipped. Answer n to skip one.")
+# ================================================================ stage 4
 
-    signin("Git name and email",
-           lambda: bool(output_of(["git", "config", "--global", "user.email"])),
-           git_identity,
-           'git config --global user.name "..." ; git config --global user.email "..."')
-    signin("SSH key", SSH_KEY.exists, ssh_key,
-           "SSH key: ssh-keygen -t ed25519")
-    signin("GitHub (gh)", lambda: succeeds(["gh", "auth", "status"]), gh_login,
-           "gh auth login --git-protocol ssh --web")
-    signin("Google Cloud (gcloud)", lambda: bool(gcloud_account()), gcloud_login,
-           "gcloud auth login")
-    signin("Google Cloud credentials for SDKs (ADC)", ADC_FILE.exists, gcloud_adc,
-           "gcloud auth application-default login")
-    signin("Claude Code", lambda: succeeds([claude_cmd(), "auth", "status"]), claude_login,
-           "claude auth login")
-    signin("Gemini CLI", GEMINI_CREDS.exists, gemini_login, "Gemini CLI: run `gemini` and log in with Google")
-    signin("Codex CLI", lambda: succeeds(["codex", "login", "status"]), codex_login, "codex login")
-    signin("Hugging Face", lambda: succeeds(["hf", "auth", "whoami"]), hf_login, "hf auth login")
-    signin("Google Drive mount (~/GoogleDrive)",
-           lambda: gdrive_signed_in() and unit_enabled(GDRIVE_UNIT, user=True), gdrive_login,
-           f"Google Drive mount: python3 {INSTALLED_COPY} --auth (or rclone config create "
-           f"{GDRIVE_REMOTE} drive, then systemctl --user enable --now {GDRIVE_UNIT})")
-    signin("Tailscale", lambda: succeeds(["tailscale", "status"]), tailscale_login,
-           f"sudo tailscale up --operator={username()}")
-    api_keys()
-    open_apps()
-    write_todo()
+def bench_entries():
+    if not BENCH_LIST.exists():
+        write_user_file(BENCH_LIST, BENCH_LIST_DEFAULT)
+    text = BENCH_LIST.read_text() if BENCH_LIST.exists() else BENCH_LIST_DEFAULT
+    return [l.strip() for l in text.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
+def stage4_baseline():
+    entries = bench_entries()
+    tests = [e for e in entries if e.startswith("pts/")]
+    commands = [e[4:].strip() for e in entries if e.startswith("run:")]
+    out = BENCH_ROOT / machine_id() / f"{STAMP}-baseline"
+    name = re.sub(r"[^a-z0-9-]", "-", f"{machine_id()}-baseline-{STAMP}".lower())
+
+    def snapshot():
+        say(f"   Results: {out}")
+        if DRY_RUN:
+            return
+        out.mkdir(parents=True, exist_ok=True)
+        info = {
+            "machine": machine_id(), "when": STAMP, "blocks": sorted(BLOCKS), "extras": sorted(ENABLED),
+            "hardware": {k: v for k, v in FACTS["hw"].items() if k not in ("batteries",)},
+            "kernel": os.uname().release, "cmdline": read_sys("/proc/cmdline"),
+            "tuned": output_of(["tuned-adm", "active"]), "power_profile": output_of(["powerprofilesctl", "get"]),
+            "cpu_driver": read_sys("/sys/devices/system/cpu/amd_pstate/status")
+            or read_sys("/sys/devices/system/cpu/intel_pstate/status"),
+            "sysctl": {k: sysctl_value(k) for k in ("vm.swappiness", "vm.vfs_cache_pressure",
+                                                     "vm.max_map_count", "net.ipv4.tcp_congestion_control")},
+            "on_ac_power": on_ac_power(),
+        }
+        (out / "system.json").write_text(json.dumps(info, indent=2, default=str) + "\n")
+        (out / "system-info.txt").write_text(output_of(["phoronix-test-suite", "system-info"]) + "\n")
+
+    def pts_run():
+        if not tests:
+            say("   No pts/ tests in the list.")
+            return
+        say(f"   Tests: {', '.join(tests)} (downloaded on first use)")
+        run(["phoronix-test-suite", "batch-install", *tests])
+        env = dict(os.environ, TEST_RESULTS_NAME=name, TEST_RESULTS_IDENTIFIER="baseline",
+                   TEST_RESULTS_DESCRIPTION=f"Stock settings on {machine_id()}")
+        if run(["phoronix-test-suite", "batch-benchmark", *tests], env=env).returncode != 0:
+            failed("Phoronix Test Suite run (see log)")
+        if DRY_RUN:
+            return
+        results = HOME / ".phoronix-test-suite" / "test-results" / name
+        if results.is_dir():
+            shutil.copytree(results, out / "pts", dirs_exist_ok=True)
+        for fmt in ("csv", "json"):
+            run(["phoronix-test-suite", f"result-file-to-{fmt}", name])
+            for f in HOME.glob(f"{name}*.{fmt}"):
+                shutil.move(str(f), out / f.name)
+
+    def commands_run():
+        for i, cmd in enumerate(commands, 1):
+            cmd = cmd.replace("{out}", str(out))
+            say(f"   {cmd}")
+            r = run(["bash", "-c", cmd])
+            if not DRY_RUN:
+                slug = re.sub(r"[^a-z0-9]+", "-", cmd.lower()).strip("-")[:40]
+                (out / f"{i:02d}-{slug}.txt").write_text(f"$ {cmd}\n\n{r.stdout}{r.stderr}")
+
+    ensure_ac_power("the benchmarks")
+    run_tasks("Stage 4 of 4: baseline benchmarks (Phase C)", [
+        ("System snapshot", snapshot),
+        ("Phoronix Test Suite", pts_run),
+        ("Other benchmark commands", commands_run),
+    ])
+    say(f"\n   Edit the list any time: {BENCH_LIST}")
 
 
 # ================================================================ summary
 
 def summary():
-    step("Summary")
+    banner("Summary")
     for item in SKIPPED:
         say(f"- Skipped: {item}")
     for item in FAILURES:
@@ -1847,26 +2919,52 @@ def summary():
     say(f"- Full log: {LOG_FILE}")
 
 
-# ---------------------------------------------------------------- main
+# ================================================================ main
+
+def parse_option_names(values):
+    names = set()
+    for v in values or []:
+        for n in v.split(","):
+            n = n.strip()
+            if not n:
+                continue
+            if n not in OPTIONS:
+                sys.exit(f"Unknown option '{n}'. Known: {', '.join(OPTIONS)}")
+            names.add(n)
+    return names
+
 
 def main():
-    global DRY_RUN, LOG
+    global DRY_RUN, VERBOSE, LOG
 
-    parser = argparse.ArgumentParser(description="Fedora KDE desktop post-install: personal software and tooling.")
+    parser = argparse.ArgumentParser(description="Fedora KDE post-install: software, tooling and tweaks.")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every command that would change the system, without running it")
-    parser.add_argument("--stage", type=int, choices=(1, 2, 3), help="run only this stage")
-    parser.add_argument("--auth", action="store_true", help="sign-ins only (same as --stage 3)")
-    parser.add_argument("--check", action="store_true", help="only the validation pass (read-only)")
+    parser.add_argument("--stage", type=int, choices=(1, 2, 3, 4), help="run only this stage")
+    parser.add_argument("--auth", action="store_true", help="sign-ins only")
+    parser.add_argument("--benchmark", action="store_true", help="baseline benchmarks only (stage 4)")
+    parser.add_argument("--check", action="store_true", help="validation only, including post-reboot checks")
+    parser.add_argument("--with", dest="with_", action="append", metavar="NAME[,NAME]",
+                        help="turn on opt-in extras (remembered for later runs)")
+    parser.add_argument("--without", action="append", metavar="NAME[,NAME]", help="turn extras off again")
+    parser.add_argument("--list-options", action="store_true", help="show the opt-in extras")
+    parser.add_argument("--verbose", action="store_true", help="also print every command as it runs")
     args = parser.parse_args()
-    DRY_RUN = args.dry_run
-    only = 3 if args.auth else args.stage
+    DRY_RUN, VERBOSE = args.dry_run, args.verbose
+
+    if args.list_options:
+        for name, (what, need) in OPTIONS.items():
+            print(f"  {name:<20} {what}" + (f"  [{need} only]" if need else ""))
+        return
 
     # Root would put the Flatpaks, CLIs and sign-ins in /root instead of your home.
     if os.geteuid() == 0:
         print("Don't run this as root or with sudo. Rerun it as your normal user:\n"
               f"    python3 {SCRIPT}")
         sys.exit(1)
+
+    ENABLED.update((load_options() | parse_option_names(args.with_)) - parse_option_names(args.without))
+    save_options(ENABLED)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     LOG = open(LOG_FILE, "w")
@@ -1881,45 +2979,81 @@ def main():
     check_fedora()
     detect_hardware()
     if args.check:
-        validate(retry=False)
+        banner("Checking everything (read-only)")
+        validate(retry=False, post_reboot=True)
         return
 
-    # The autostart entry is only for the first login after a reboot.
-    if not DRY_RUN:
-        set_autostart(False)
     install_copy()
     check_wheel()
     stop_sudo = start_sudo()
     try:
-        stage = only or saved_stage()
-        if stage == 4:
-            say("All three stages are already done. Checking everything is still installed.")
-            say("(Sign-ins again: --auth. A single stage again: --stage N.)")
-            validate(retry=True)
+        if args.auth:
+            banner("Sign-ins")
+            signins()
+            api_keys()
+            open_apps()
+            write_todo()
+        elif args.benchmark:
+            stage4_baseline()
         elif DRY_RUN:
             # Preview from here to the end, without saving progress or rebooting.
-            for n in range(stage, 4 if not only else stage + 1):
-                (stage1_clean_base, lambda: (stage2_install(), validate()), stage3_signin)[n - 1]()
-        elif stage == 1:
-            stage1_clean_base()
-            summary()
-            if not only:
-                reboot_and_continue(2)
-        elif stage == 2:
-            stage2_install()
-            validate()
-            summary()
-            if not only:
-                reboot_and_continue(3)
-        elif stage == 3:
-            stage3_signin()
-            summary()
-            if not only:
-                save_stage(4)
-            say(f"\nAll done. Remaining manual steps: {TODO_FILE}")
+            start = args.stage or min(saved_stage(), 4)
+            for n in range(start, 5 if not args.stage else start + 1):
+                (stage1_clean_base, stage2_install, stage3_configure, stage4_baseline)[n - 1]()
+        else:
+            # The autostart entry is only for the first login after a reboot.
+            set_autostart(False)
+            stage = args.stage or saved_stage()
+            if stage == 1:
+                stage1_clean_base()
+                summary()
+                if not args.stage:
+                    save_stage(2)
+                    ask_reboot("stage 2 (install)")
+            elif stage == 2:
+                stage2_install()
+                summary()
+                if not args.stage:
+                    save_stage(3)
+                    ask_reboot("stage 3 (configure and sign in)")
+            elif stage == 3:
+                stage3_configure()
+                if not args.stage:
+                    save_stage(4)
+                if FACTS.get("reboot_for_hibernate"):
+                    summary()
+                    ask_reboot("the hibernation step")
+                    return
+                if not args.stage:
+                    if yes("\nRun the baseline benchmarks now? They take 20-60 minutes; "
+                           "leave the machine alone meanwhile.", default=False):
+                        stage4_baseline()
+                    else:
+                        say(f"Later: python3 {INSTALLED_COPY} --benchmark")
+                    save_stage(DONE)
+                summary()
+            elif stage == 4:
+                stage4_baseline()
+                if not args.stage:
+                    save_stage(DONE)
+                summary()
+            else:
+                banner("All stages are done")
+                hib = hibernate_state()
+                if hib in ("needs-setup", "needs-reboot", "needs-lid"):
+                    say("Picking up the hibernation step:")
+                    hibernate_finish()
+                    if FACTS.get("reboot_for_hibernate"):
+                        summary()
+                        ask_reboot("the hibernation step")
+                        return
+                say("Checking everything is still installed and live.")
+                say("(Sign-ins: --auth. Benchmarks: --benchmark. A single stage: --stage N.)")
+                validate(retry=True, post_reboot=True)
+                summary()
     except KeyboardInterrupt:
         # Keep the autostart so the next login picks this stage up again.
-        if not only and not DRY_RUN and saved_stage() in (2, 3):
+        if not DRY_RUN and saved_stage() in (2, 3, 4):
             set_autostart(True)
         fatal("interrupted. Run the same command again to continue.")
     finally:
