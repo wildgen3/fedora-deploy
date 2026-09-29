@@ -35,7 +35,7 @@ Logs: `~/postinstall-logs/`. Re-running is safe; finished steps are skipped.
 |---|---|---|
 | Browsers and editors | Google Chrome, VS Code | Google / Microsoft RPM repos |
 | Antigravity | Antigravity (agent app) and Antigravity IDE | Google's download page (tarballs), current version read on each run |
-| AI apps and CLIs | ChatGPT desktop; Claude Code, Gemini CLI, Codex CLI, Hugging Face `hf` | OpenAI RPM repo; Anthropic installer, npm, uv |
+| AI apps and CLIs | ChatGPT desktop (includes the Codex app); Claude Code, Gemini CLI, Codex CLI, Hugging Face `hf` | OpenAI RPM repo; Anthropic installer, npm, uv |
 | Agent SDKs | anthropic, claude-agent-sdk, google-genai, google-adk, openai, openai-agents, mcp, litellm | `~/.venvs/agents` (activate with `agents`) |
 | Local AI | ollama, ramalama, llama.cpp, ROCm runtime | Fedora |
 | Cloud | Google Cloud CLI, GKE auth plugin, kubectl, skaffold | Google RPM repo |

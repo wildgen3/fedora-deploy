@@ -94,7 +94,8 @@ gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key-v10.gpg
 """,
 }
 
-# OpenAI publishes no key URL: its first RPM installs the signing key and
+# The ChatGPT desktop app for Linux includes Codex (and ChatGPT Work). OpenAI
+# publishes no key URL: its first RPM installs the signing key and
 # OpenAI's signed repo, and later updates come through dnf from that repo.
 CHATGPT_RPM = "https://persistent.oaistatic.com/codex-app-prod/linux/rpm/latest/chatgpt.x86_64.rpm"
 
@@ -253,6 +254,7 @@ VSCODE_EXTENSIONS = {
     "anthropic.claude-code": "Claude Code",
     "google.geminicodeassist": "Gemini Code Assist",
     "saoudrizwan.claude-dev": "Cline",
+    "openai.chatgpt": "Codex (OpenAI)",
     "ms-python.python": "Python",
     "ms-python.vscode-pylance": "Pylance",
     "charliermarsh.ruff": "Ruff",
@@ -344,10 +346,11 @@ SIGNIN_APPS = [
     ("Google Chrome", ["google-chrome"], "Sign in to Google and turn on sync."),
     ("VS Code", ["code"],
      "Accounts (bottom left) > Backup and Sync Settings. Then sign in to Claude Code, "
-     "Gemini Code Assist and Cline from their sidebar icons."),
+     "Gemini Code Assist, Codex and Cline from their sidebar icons."),
     ("Antigravity", ["google-antigravity"], "Sign in with your Google account."),
     ("Antigravity IDE", ["google-antigravity-ide", "antigravity"], "Sign in with your Google account."),
-    ("ChatGPT", ["chatgpt", "ChatGPT"], "Sign in to your OpenAI account."),
+    ("ChatGPT", ["chatgpt", "ChatGPT"],
+     "Sign in to your OpenAI account. Codex is in the app's sidebar (Linux preview)."),
     ("Discord", ["com.discordapp.Discord"], "Sign in."),
     ("Spotify", ["com.spotify.Client"], "Sign in."),
     ("Steam", ["com.valvesoftware.Steam"],
