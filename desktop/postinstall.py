@@ -11,12 +11,16 @@ It runs in three stages with a reboot between them. After each reboot a
 Konsole window opens on its own once you log in and carries on where it left
 off (you can also just run the same command again):
 
-  Stage 1  Clean base: safety checks, one sudo password prompt, full system
-           update (dnf), firmware updates (fwupd), Flatpak updates. Reboot.
+  Stage 1  Clean base: safety checks, one sudo password prompt, hardware
+           detection, full system update (dnf), firmware updates (fwupd, with
+           the pending updates listed first; laptops must be on the charger),
+           Flatpak updates. Reboot.
   Stage 2  Install: official repos (RPM Fusion, Google, Microsoft, OpenAI,
            Tailscale, Sunshine's COPR, virtio-win, Flathub), RPMs, Flatpaks,
            the Claude / Gemini / Codex / Hugging Face CLIs, the agent SDK
-           environment, VS Code extensions, AMD GPU settings, services and
+           environment, VS Code extensions, Antigravity (current version read
+           from Google's download page), GPU-specific drivers (AMD or Intel,
+           detected), services and
            groups. Then a validation pass: every item is checked, anything
            missing is retried once, and a pass/fail table is printed. Reboot.
   Stage 3  Sign-in: git identity, SSH key, GitHub, Google Cloud, Claude,
@@ -38,15 +42,19 @@ import argparse
 import datetime
 import getpass
 import grp
+import json
 import os
 import pwd
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import unquote, urljoin
 
 # ----------------------------------------------------------------- settings
 
@@ -84,14 +92,6 @@ gpgcheck=1
 repo_gpgcheck=0
 gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key-v10.gpg
 """,
-    "antigravity": """\
-[antigravity-rpm]
-name=Antigravity RPM Repository
-baseurl=https://us-central1-yum.pkg.dev/projects/antigravity-auto-updater-dev/antigravity-rpm
-enabled=1
-# Google publishes this repo unsigned (same as their own instructions).
-gpgcheck=0
-""",
 }
 
 # OpenAI publishes no key URL: its first RPM installs the signing key and
@@ -124,8 +124,7 @@ RPM_GROUPS = {
     "Python and Node": ["python3", "python3-pip", "python3-devel", "python3.13", "uv",
                         "nodejs", "npm", "gcc", "gcc-c++", "make"],
     "containers": ["podman"],
-    # ROCm runtime lets ollama and other apps use the AMD GPU.
-    "local AI": ["ollama", "ramalama", "llama-cpp", "rocm-hip", "rocm-opencl", "rocminfo"],
+    "local AI": ["ollama", "ramalama", "llama-cpp"],
     # -secret stores saved passwords in KWallet (through the Secret Service).
     "remote desktop": ["remmina", "remmina-plugins-rdp", "remmina-plugins-vnc",
                        "remmina-plugins-secret", "remmina-plugins-kwallet"],
@@ -143,7 +142,6 @@ OPTIONAL_RPMS = {"remmina-plugins-kwallet"}
 VENDOR_GROUPS = {
     "Google Chrome": ["google-chrome-stable"],
     "VS Code": ["code"],
-    "Antigravity": ["antigravity"],
     "ChatGPT": ["chatgpt"],
     "Google Cloud CLI": ["google-cloud-cli", "google-cloud-cli-gke-gcloud-auth-plugin",
                          "kubectl", "google-cloud-cli-skaffold"],
@@ -152,14 +150,54 @@ VENDOR_GROUPS = {
     "virtio-win drivers": ["virtio-win"],
 }
 
-# RPM Fusion: full codecs. Fedora's own Mesa can't encode or decode H.264/HEVC;
-# the freeworld builds can, which Sunshine (streaming to the Steam Deck) and OBS
-# need on an AMD GPU. (from, to) pairs are swapped in place.
+# RPM Fusion: full codecs. Fedora's own video drivers can't encode or decode
+# H.264/HEVC; RPM Fusion's builds can, which Sunshine (streaming to the Steam
+# Deck) and OBS need. (from, to) pairs are swapped in place.
 CODEC_SWAPS = [("ffmpeg-free", "ffmpeg"),
-               ("mesa-va-drivers", "mesa-va-drivers-freeworld"),
                ("mesa-vulkan-drivers", "mesa-vulkan-drivers-freeworld")]
+# Per GPU maker, from the hardware detection. AMD video goes through Mesa;
+# Intel through Intel's media driver. ROCm lets ollama use an AMD GPU.
+GPU_SWAPS = {
+    "amd": [("mesa-va-drivers", "mesa-va-drivers-freeworld")],
+    "intel": [("libva-intel-media-driver", "intel-media-driver")],
+}
+GPU_PACKAGES = {
+    "amd": ["rocm-hip", "rocm-opencl", "rocminfo"],
+}
 CODEC_PACKAGES = ["gstreamer1-plugins-bad-freeworld", "gstreamer1-plugins-ugly",
                   "gstreamer1-plugin-libav"]
+
+# ---- Antigravity (Google)
+
+# Google publishes Antigravity 2.x (the agent app) and the Antigravity IDE for
+# Linux only as tarballs on its download page. Its older RPM repo carried the
+# 1.x IDE. Each run reads the download page for the current versions, checks
+# the RPM repo too, and installs the IDE from whichever is newer (the app only
+# exists as a tarball). Tarballs go under ~/.local/opt (no sudo). They can't
+# update themselves: when Antigravity says an update is out, run stage 2 again.
+ANTIGRAVITY_PAGE = "https://antigravity.google/download"
+ANTIGRAVITY_REPO_URL = "https://us-central1-yum.pkg.dev/projects/antigravity-auto-updater-dev/antigravity-rpm"
+ANTIGRAVITY_REPO_FILE = """\
+[antigravity-rpm]
+name=Antigravity RPM Repository
+baseurl=https://us-central1-yum.pkg.dev/projects/antigravity-auto-updater-dev/antigravity-rpm
+enabled=1
+# Google publishes this repo unsigned (same as their own instructions).
+gpgcheck=0
+"""
+ANTIGRAVITY_DIR = Path.home() / ".local" / "opt"
+ANTIGRAVITY = {
+    # file: the tarball's name in Google's URLs. fallback: the newest known URL
+    # (2026-09-29), used only if the download page can't be read.
+    "antigravity": {
+        "label": "Antigravity", "file": r"Antigravity\.tar\.gz", "rpm": None,
+        "fallback": "https://storage.googleapis.com/antigravity-public/antigravity-hub/"
+                    "2.18.1-4945794252537856/linux-x64/Antigravity.tar.gz"},
+    "antigravity-ide": {
+        "label": "Antigravity IDE", "file": r"Antigravity(?:%20|\+| )IDE\.tar\.gz", "rpm": "antigravity",
+        "fallback": "https://edgedl.me.gvt1.com/edgedl/release2/j0qc3/antigravity/stable/"
+                    "2.5.5-4923483625488384/linux-x64/Antigravity%20IDE.tar.gz"},
+}
 
 # ---- Flatpaks (Flathub, installed for your user only)
 
@@ -307,7 +345,8 @@ SIGNIN_APPS = [
     ("VS Code", ["code"],
      "Accounts (bottom left) > Backup and Sync Settings. Then sign in to Claude Code, "
      "Gemini Code Assist and Cline from their sidebar icons."),
-    ("Antigravity", ["antigravity", "antigravity-ide"], "Sign in with your Google account."),
+    ("Antigravity", ["google-antigravity"], "Sign in with your Google account."),
+    ("Antigravity IDE", ["google-antigravity-ide", "antigravity"], "Sign in with your Google account."),
     ("ChatGPT", ["chatgpt", "ChatGPT"], "Sign in to your OpenAI account."),
     ("Discord", ["com.discordapp.Discord"], "Sign in."),
     ("Spotify", ["com.spotify.Client"], "Sign in."),
@@ -336,7 +375,10 @@ MANUAL_TODO = [
     "'Microsoft Windows 11' as the OS (adds UEFI + TPM), and attach "
     "/usr/share/virtio-win/virtio-win.iso as a second CD for the drivers.",
     "Local AI test: `ollama run llama3.2` and `ramalama run llama3.2`; keep whichever is faster.",
-    "Antigravity: add extensions from its own store (it doesn't share VS Code's).",
+    "Antigravity IDE: add extensions from its own store (it doesn't share VS Code's).",
+    f"Antigravity updates: when it says a new version is out, run "
+    f"`python3 {Path.home() / '.local/share/desktop-postinstall/postinstall.py'} --stage 2` "
+    f"(tarball installs can't update themselves).",
 ]
 
 # ---- where things go
@@ -532,6 +574,83 @@ def check_wheel():
     if wheel_gid not in os.getgroups() and wheel_gid != os.getgid():
         fatal("your user is not in the 'wheel' group, so it can't use sudo.\n"
               "Make it an administrator (or: usermod -aG wheel <you> as root), log out and in, then rerun.")
+
+
+def read_sys(path):
+    try:
+        return Path(path).read_text(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+# SMBIOS chassis types for portable machines (notebook, laptop, convertible, ...).
+LAPTOP_CHASSIS = {"8", "9", "10", "14", "30", "31", "32"}
+GPU_MAKERS = {"1002": "amd", "8086": "intel", "10de": "nvidia"}
+
+
+def detect_hardware():
+    """Read what this machine is, so later steps can match it (firmware, GPU
+    drivers, charger checks). Read-only; runs on every start."""
+    step("Hardware")
+    dmi = Path("/sys/class/dmi/id")
+    cpuinfo = read_sys("/proc/cpuinfo")
+    m = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
+    gpus = [line for cls in ("0300", "0302", "0380")
+            for line in output_of(["lspci", "-nn", "-d", f"::{cls}"]).splitlines() if line.strip()]
+    batteries = [d for d in Path("/sys/class/power_supply").glob("*")
+                 if read_sys(d / "type") == "Battery"]
+    hw = {
+        "vendor": read_sys(dmi / "sys_vendor"),
+        "model": read_sys(dmi / "product_name"),
+        "cpu": m.group(1).strip() if m else "unknown",
+        "gpus": gpus,
+        "gpu_makers": sorted({GPU_MAKERS[v] for line in gpus
+                              for v in re.findall(r"\[([0-9a-f]{4}):[0-9a-f]{4}\]", line)
+                              if v in GPU_MAKERS}),
+        "laptop": bool(batteries) or read_sys(dmi / "chassis_type") in LAPTOP_CHASSIS,
+        "batteries": batteries,
+        # systemd-detect-virt prints "none" (and exits 1) on real hardware.
+        "virt": run(["systemd-detect-virt"], changes_system=False).stdout.strip() or "none",
+    }
+    FACTS["hw"] = hw
+    say(f"Machine: {hw['vendor'] or '?'} {hw['model'] or ''}".rstrip()
+        + (" (laptop)" if hw["laptop"] else "") + (f" (virtual: {hw['virt']})" if hw["virt"] != "none" else ""))
+    say(f"CPU: {hw['cpu']}")
+    for line in gpus or ["none found by lspci"]:
+        say(f"GPU: {line}")
+    if hw["laptop"]:
+        say(f"Power: {'charger connected' if on_ac_power() else 'on battery'}"
+            + (f", battery {battery_percent()}%" if battery_percent() is not None else ""))
+
+
+def on_ac_power():
+    """True on a desktop, or when a laptop's charger is connected."""
+    if not FACTS["hw"]["batteries"]:
+        return True
+    for d in Path("/sys/class/power_supply").glob("*"):
+        if read_sys(d / "type") in ("Mains", "USB") and read_sys(d / "online") == "1":
+            return True
+    return False
+
+
+def battery_percent():
+    levels = [int(v) for v in (read_sys(b / "capacity") for b in FACTS["hw"]["batteries"]) if v.isdigit()]
+    return min(levels) if levels else None
+
+
+def ensure_ac_power(what):
+    """Laptops: don't start long updates or firmware flashing on battery."""
+    if on_ac_power():
+        return
+    if DRY_RUN:
+        say(f"[dry-run] on battery: a real run asks you to plug in before {what}")
+        return
+    warn(f"this laptop is on battery. Plug in the charger before {what}.")
+    while not on_ac_power():
+        if ask("   Press Enter once it's plugged in (s = continue on battery): ").lower() == "s":
+            warn(f"continuing {what} on battery")
+            return
+    say("   Charger connected.")
 
 
 def keep_sudo_alive(stop):
@@ -738,20 +857,66 @@ def unit_enabled(unit, user=False):
 def stage1_clean_base():
     step("Stage 1: clean base (system update)")
     say("A full update on a fresh install can take a while.")
+    ensure_ac_power("the system update")
     if run(["sudo", "dnf", "upgrade", "--refresh", "-y"]).returncode != 0:
         fatal("`dnf upgrade` failed. Fix networking/repos and rerun.")
-
-    say("-- firmware (fwupd)")
-    # refresh: download the firmware catalogue. update: exit code 2 means
-    # "nothing to update", which is fine.
-    run(["sudo", "fwupdmgr", "refresh", "--force"])
-    r = run(["sudo", "fwupdmgr", "update", "-y", "--no-reboot-check"])
-    if r.returncode not in (0, 2):
-        warn("firmware update reported a problem (see log); continuing")
+    firmware_updates()
 
     say("-- Flatpaks that came with the system")
     if run(["sudo", "flatpak", "update", "-y", "--noninteractive"]).returncode != 0:
         warn("flatpak update reported a problem (see log); continuing")
+
+
+def pending_firmware():
+    """[(device, current, new)] from `fwupdmgr get-updates --json`."""
+    r = run(["fwupdmgr", "get-updates", "--json"], changes_system=False)
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return []  # exit code 2 prints a plain "no updates" message instead
+    found = []
+    for dev in data.get("Devices", []):
+        releases = dev.get("Releases") or [{}]
+        found.append((dev.get("Name", "?"), dev.get("Version", "?"), releases[0].get("Version", "?")))
+    return found
+
+
+def firmware_updates():
+    """fwupd updates firmware from the LVFS, where vendors (Framework, Dell,
+    Lenovo, SSD and dock makers, ...) publish it. What it finds depends on the
+    machine, so the pending list is shown before anything is flashed."""
+    step("Firmware (fwupd)")
+    hw = FACTS["hw"]
+    if hw["virt"] != "none":
+        skipped(f"firmware: this is a virtual machine ({hw['virt']})")
+        return
+    # Download the current catalogue first (the one on a fresh install is old).
+    run(["sudo", "fwupdmgr", "refresh", "--force"])
+    devices = output_of(["fwupdmgr", "get-devices", "--json"])
+    try:
+        count = sum(1 for d in json.loads(devices).get("Devices", [])
+                    if "updatable" in d.get("Flags", []))
+        say(f"Devices fwupd can update on this {hw['vendor'] or 'machine'}: {count}")
+    except ValueError:
+        pass
+    pending = pending_firmware()
+    if not pending:
+        say("No firmware updates pending." + (" (dry run: the catalogue isn't refreshed, so "
+                                              "a real run may find some)" if DRY_RUN else ""))
+        return
+    say("Pending firmware updates:")
+    for name, cur, new in pending:
+        say(f"  - {name}: {cur} -> {new}")
+    # fwupd refuses system-firmware updates on battery; check before starting.
+    ensure_ac_power("firmware updates")
+    # -y: no questions. --no-reboot-check: this script reboots at the end.
+    # Some updates (BIOS/UEFI) are only staged now and flashed during the reboot.
+    r = run(["sudo", "fwupdmgr", "update", "-y", "--no-reboot-check"])
+    if r.returncode not in (0, 2):
+        warn("firmware update reported a problem (see log); continuing")
+    else:
+        NOTES.append("Firmware updates may finish during the reboot: leave the machine "
+                     "plugged in and don't power it off while it shows a progress screen.")
 
 
 # ================================================================ stage 2
@@ -801,10 +966,20 @@ def setup_repos():
         failed("add Flathub")
 
 
+def gpu_makers():
+    return [m for m in ("amd", "intel") if m in FACTS["hw"]["gpu_makers"]]
+
+
 def install_codecs():
-    step("Codecs and AMD video encoding (RPM Fusion)")
+    step("Codecs and GPU video drivers (RPM Fusion)")
     for old, new in CODEC_SWAPS:
         swap_package(old, new)
+    for maker in gpu_makers():
+        say(f"-- {maker.upper()} GPU")
+        for old, new in GPU_SWAPS.get(maker, []):
+            swap_package(old, new)
+        if GPU_PACKAGES.get(maker):
+            install_packages(GPU_PACKAGES[maker], f"{maker.upper()} GPU compute")
     install_packages(CODEC_PACKAGES, "GStreamer codecs")
 
 
@@ -958,13 +1133,166 @@ def install_vscode_extensions():
             failed(f"VS Code extension {ext}")
 
 
-def amd_gpu():
-    step("AMD GPU")
-    gpus = "\n".join(output_of(["lspci", "-nn", "-d", f"::{cls}"]) for cls in ("0300", "0302", "0380"))
-    say(gpus.strip() or "no GPU found by lspci")
-    FACTS["gpus"] = gpus.strip()
+def version_key(v):
+    """'2.18.1' -> (2, 18, 1) for comparing versions."""
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:3])
+
+
+def url_version(url):
+    """Google's download URLs carry the version: .../2.18.1-4945794252537856/linux-x64/..."""
+    m = re.search(r"/(\d+\.\d+\.\d+)-\d+/", unquote(url))
+    return m.group(1) if m else ""
+
+
+def antigravity_published():
+    """{product: (version, url)} for the current Linux x64 tarballs, read from
+    the JavaScript behind Google's download page (the page builds its download
+    buttons from it). Falls back to the newest known URLs if that fails."""
+    if "antigravity" in FACTS:
+        return FACTS["antigravity"]
+    found = {}
+    html = output_of(["curl", "-fsSL", "--compressed", "--max-time", "30", ANTIGRAVITY_PAGE])
+    bundles = re.findall(r"""(?:src|href)=["']([^"']+\.js)["']""", html)
+    bundles.sort(key=lambda b: "main" not in b)  # the app bundle holds the download list
+    for bundle in bundles[:8]:
+        js = output_of(["curl", "-fsSL", "--compressed", "--max-time", "30",
+                        urljoin(ANTIGRAVITY_PAGE, bundle)]).replace("\\/", "/")
+        for key, p in ANTIGRAVITY.items():
+            for url in re.findall(r"https?://[^\"'\s<>)]+/linux-x64/" + p["file"], js):
+                ver = url_version(url)
+                if ver and (key not in found or version_key(ver) > version_key(found[key][0])):
+                    found[key] = (ver, url)
+    for key, p in ANTIGRAVITY.items():
+        if key not in found:
+            warn(f"couldn't read {p['label']}'s current version from {ANTIGRAVITY_PAGE}; "
+                 f"using the newest known ({url_version(p['fallback'])})")
+            found[key] = (url_version(p["fallback"]), p["fallback"])
+    FACTS["antigravity"] = found
+    return found
+
+
+def antigravity_rpm_version(name):
+    """Newest version of `name` in Google's RPM repo, queried without adding
+    the repo to the system ('' if it isn't there)."""
+    r = run(["dnf", "-q", "repoquery", f"--repofrompath=antigravity-check,{ANTIGRAVITY_REPO_URL}",
+             "--repo=antigravity-check", "--latest-limit=1", "--qf", "%{version}\n", name],
+            changes_system=False)
+    lines = [l for l in r.stdout.split() if re.match(r"\d+\.\d+", l)]
+    return lines[-1] if r.returncode == 0 and lines else ""
+
+
+def antigravity_installed_version(key):
+    """Installed version: from the tarball install's .version file, else the RPM."""
+    ver = read_sys(ANTIGRAVITY_DIR / key / ".version")
+    if ver:
+        return ver
+    rpm = ANTIGRAVITY[key]["rpm"]
+    return output_of(["rpm", "-q", "--qf", "%{VERSION}", rpm]) if rpm else ""
+
+
+def install_antigravity():
+    step("Antigravity (Google)")
+    published = antigravity_published()
+    for key, p in ANTIGRAVITY.items():
+        ver, url = published[key]
+        say(f"-- {p['label']}: Google's download page has {ver}")
+        if p["rpm"]:
+            rpm_ver = antigravity_rpm_version(p["rpm"])
+            say(f"   Google's RPM repo has {rpm_ver or 'no build'}")
+            if rpm_ver and version_key(rpm_ver) >= version_key(ver):
+                say("   Using the RPM repo (updates then come with dnf).")
+                write_root_file(f"/etc/yum.repos.d/{p['rpm']}.repo", ANTIGRAVITY_REPO_FILE)
+                install_packages([p["rpm"]], p["label"])
+                continue
+        have = antigravity_installed_version(key)
+        if have and version_key(have) >= version_key(ver):
+            say(f"   {have} is installed: up to date")
+            continue
+        say(f"   Installing {ver} from Google's tarball" + (f" (replacing {have})" if have else ""))
+        install_antigravity_tarball(key, ver, url)
+
+
+def asar_extract(asar, name, out):
+    """Copy one top-level file out of an Electron .asar archive. Layout: a
+    4-byte size, the header's size, then the header (JSON listing each file's
+    offset and size), then the file data."""
+    try:
+        with open(asar, "rb") as f:
+            _, header_size, _, json_size = struct.unpack("<4I", f.read(16))
+            entry = json.loads(f.read(json_size))["files"][name]
+            f.seek(8 + header_size + int(entry["offset"]))
+            Path(out).write_bytes(f.read(entry["size"]))
+        return True
+    except (OSError, ValueError, KeyError, struct.error):
+        return False
+
+
+def install_antigravity_tarball(key, ver, url):
+    """Unpack Google's tarball to ~/.local/opt/<key>, then add a command in
+    ~/.local/bin and a menu entry. The old copy is only removed once the new
+    one is in place."""
+    p = ANTIGRAVITY[key]
+    dest = ANTIGRAVITY_DIR / key
+    if DRY_RUN:
+        say(f"[dry-run] download {url}")
+        say(f"[dry-run] unpack it to {dest}, link {LOCAL_BIN / key}, add a menu entry")
+        return
+    # Unpack next to the destination so the final move is a quick rename.
+    ANTIGRAVITY_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{key}-", dir=ANTIGRAVITY_DIR))
+    try:
+        archive = tmp / "download.tar.gz"
+        if run(["curl", "-fL", "--retry", "3", "-o", str(archive), url]).returncode != 0:
+            failed(f"download {p['label']}")
+            return
+        unpacked = tmp / "unpacked"
+        unpacked.mkdir()
+        if run(["tar", "-xzf", str(archive), "-C", str(unpacked)]).returncode != 0:
+            failed(f"unpack {p['label']}")
+            return
+        # The launcher is `antigravity` or `antigravity-ide`, one folder down.
+        exe = next((f for f in sorted(unpacked.glob(f"*/{key}")) if os.access(f, os.X_OK)), None)
+        if not exe:
+            failed(f"{p['label']}: no `{key}` launcher inside the tarball")
+            return
+        app_dir = exe.parent
+        (app_dir / ".version").write_text(f"{ver}\n")
+        (app_dir / ".source-url").write_text(f"{url}\n")
+        if dest.exists():
+            dest.rename(tmp / "previous")  # deleted with tmp below
+        app_dir.rename(dest)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+    link = LOCAL_BIN / key
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(dest / key)
+    # The IDE ships its icon as a file; the app keeps it inside resources/app.asar.
+    icon = dest / "resources/app/resources/linux/code.png"
+    if not icon.exists():
+        icon = dest / "icon.png"
+        if not icon.exists() and not asar_extract(dest / "resources/app.asar", "icon.png", icon):
+            icon = "applications-development"  # generic theme icon
+    write_user_file(HOME / ".local/share/applications" / f"google-{key}.desktop", f"""\
+[Desktop Entry]
+Type=Application
+Name={p['label']}
+Comment=Google {p['label']} {ver} (installed by {SCRIPT})
+Exec={dest / key} %U
+Icon={icon}
+Terminal=false
+Categories=Development;IDE;
+""")
+    say(f"   Installed {p['label']} {ver} in {dest}")
+
+
+def gpu_settings():
+    step("GPU settings")
+    gpus = "\n".join(FACTS["hw"]["gpus"])
     if "[1002:" not in gpus:
-        skipped("no AMD GPU found, so no GPU overrides were set")
+        say("No AMD GPU, so no ROCm overrides are needed.")
         return
     if not NAVI_23_24.search(gpus):
         say("This AMD GPU is supported by ROCm; no override needed.")
@@ -1045,7 +1373,8 @@ def stage2_install():
     install_agent_sdks()
     install_shell_config()
     install_vscode_extensions()
-    amd_gpu()
+    install_antigravity()
+    gpu_settings()
     setup_services()
 
 
@@ -1059,8 +1388,11 @@ def collect_checks():
             if name in OPTIONAL_RPMS:
                 continue
             rows.append(("rpm", f"{name} ({label})", rpm_installed(name)))
-    for old, new in CODEC_SWAPS:
+    for old, new in CODEC_SWAPS + [sw for m in gpu_makers() for sw in GPU_SWAPS.get(m, [])]:
         rows.append(("codecs", new, rpm_installed(new)))
+    for m in gpu_makers():
+        for name in GPU_PACKAGES.get(m, []):
+            rows.append(("codecs", name, rpm_installed(name)))
     for name in CODEC_PACKAGES:
         rows.append(("codecs", name, rpm_installed(name)))
 
@@ -1086,6 +1418,13 @@ def collect_checks():
     for ext, label in VSCODE_EXTENSIONS.items():
         rows.append(("vscode", label, ext.lower() in have))
 
+    published = antigravity_published()
+    for key, p in ANTIGRAVITY.items():
+        have = antigravity_installed_version(key)
+        want = published[key][0]  # current version on Google's download page
+        ok = bool(have) and version_key(have) >= version_key(want)
+        rows.append(("antigravity", f"{p['label']} {want}", ok))
+
     for unit in SYSTEM_SERVICES:
         rows.append(("service", unit, unit_enabled(unit)))
     for unit in USER_SERVICES:
@@ -1105,6 +1444,7 @@ RETRY = {
     "cli": install_cli_tools,
     "sdk": install_agent_sdks,
     "vscode": install_vscode_extensions,
+    "antigravity": lambda: install_antigravity(),
     "service": setup_services,
     "group": setup_services,
     "shell": install_shell_config,
@@ -1118,7 +1458,7 @@ def print_table(rows, retried=()):
             mark = "FIXED" if (area, item) in retried else "ok"
         else:
             mark = "FAILED"
-        say(f"  {area:<10} {item:<{width}}  {mark}")
+        say(f"  {area:<12} {item:<{width}}  {mark}")
 
 
 def validate(retry=True):
@@ -1423,6 +1763,7 @@ def main():
     os.environ["PATH"] = f"{LOCAL_BIN}:{os.environ.get('PATH', '')}"
 
     check_fedora()
+    detect_hardware()
     if args.check:
         validate(retry=False)
         return
