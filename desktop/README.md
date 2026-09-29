@@ -83,7 +83,7 @@ The full list, one line per package with what it's for, is `RPM_GROUPS` at the t
 
 On a Framework laptop, closing the lid puts it in the lowest-drain state, which is hibernate. The behaviour is set by `LID_ACTION` at the top of the script, and `suspend-then-hibernate` is the alternative.
 
-- **Secure Boot must be off.** Kernel lockdown, which comes with Secure Boot, blocks hibernation. If Secure Boot is on, the script says so and skips this part. It picks the step up on the next run once Secure Boot is off.
+- **Only with Secure Boot off.** Kernel lockdown, which comes with Secure Boot, blocks hibernation. Secure Boot stays on for these machines, so the script detects that, skips all of the hibernation steps, and lid close stays at sleep (s2idle). The Intel `acpi_osi` fix still applies.
 - **Stage 2:** Btrfs subvolume `/swap` with a swap file the size of RAM (low priority, so zram still handles everyday swap), SELinux label, fstab entry, `resume=`/`resume_offset=`, dracut resume module, `HibernateDelaySec=30min`.
 - **Stage 3:** lid action in systemd-logind (`10-lid.conf`: battery and charger = hibernate, docked = ignore) and in KDE PowerDevil, then an optional test hibernate that checks the journal and SELinux.
 - **Encryption:** the hibernation image is a copy of RAM, and it's unencrypted unless the disk is.

@@ -1014,7 +1014,11 @@ def detect_hardware():
         BLOCKS.add("framework")
         BLOCKS.add(f"framework-{cpu_vendor}")
     if "laptop" in BLOCKS and "framework" in BLOCKS and virt == "none":
-        BLOCKS.add("hibernate")
+        # Secure Boot stays on; with it on, kernel lockdown blocks hibernation.
+        if secure_boot_on():
+            FACTS["secure_boot"] = True
+        else:
+            BLOCKS.add("hibernate")
     if "amd-gpu" in BLOCKS and ("desktop" in BLOCKS or "igpu-overclock" in ENABLED):
         BLOCKS.add("amd-gpu-tuning")
 
@@ -1032,6 +1036,8 @@ def detect_hardware():
         say(f"GPU:     {line}")
     if "nvidia" in drivers or "nouveau" in drivers:
         say("         (NVIDIA GPU found: this script never installs NVIDIA packages.)")
+    if FACTS.get("secure_boot"):
+        say("Secure Boot: on (hibernation not available; lid close = sleep)")
     if batteries:
         say(f"Power:   laptop, {'charger connected' if on_ac_power() else 'on battery'}"
             + (f", battery {battery_percent()}%" if battery_percent() is not None else ""))
@@ -2111,12 +2117,15 @@ def hibernate_state():
 
 
 def secure_boot_message():
-    say("   Secure Boot is on. Kernel lockdown (part of Secure Boot) blocks writing a")
-    say("   hibernation image, so lid close stays at normal sleep for now.")
-    say("   To get hibernate: reboot into the Framework BIOS (F2), turn Secure Boot off,")
-    say(f"   then run python3 {INSTALLED_COPY} again; it picks this step up.")
-    TODO.append("Hibernate: turn Secure Boot off in the Framework BIOS (F2), then run "
-                f"python3 {INSTALLED_COPY} again.")
+    say("   Secure Boot is on, and kernel lockdown (part of Secure Boot) blocks hibernation.")
+    say("   Lid close stays at sleep (s2idle), the lowest-drain state available with it on.")
+
+
+def no_hibernate_message():
+    if FACTS.get("secure_boot"):
+        secure_boot_message()
+    else:
+        say("   Not a Framework laptop: hibernation isn't set up.")
 
 
 def hibernate_setup():
@@ -2124,7 +2133,7 @@ def hibernate_setup():
     kernel arguments and boot image. Takes effect after the reboot."""
     state = hibernate_state()
     if state == "n/a":
-        say("   Not a Framework laptop: hibernation isn't set up.")
+        no_hibernate_message()
         return
     if state == "secure-boot":
         secure_boot_message()
@@ -2194,7 +2203,7 @@ def hibernate_finish():
     """Phase B: lid action (systemd + KDE), then an optional test."""
     state = hibernate_state()
     if state == "n/a":
-        say("   Not a Framework laptop: nothing to do.")
+        no_hibernate_message()
         return
     if state == "secure-boot":
         secure_boot_message()
@@ -2417,7 +2426,6 @@ def verify_checks():
     if "laptop" in BLOCKS:
         rows.append(("live", "sleep mode s2idle", "[s2idle]" in read_sys("/sys/power/mem_sleep")))
     if "hibernate" in BLOCKS:
-        rows.append(("live", "Secure Boot off (needed for hibernate)", not secure_boot_on()))
         rows.append(("live", "resume= / resume_offset= active", "resume_offset=" in read_sys("/proc/cmdline")))
         rows.append(("live", "hibernation swap file active", str(SWAP_FILE) in read_sys("/proc/swaps")))
         rows.append(("live", "hibernate possible (logind)", can_hibernate()))
