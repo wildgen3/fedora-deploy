@@ -918,6 +918,35 @@ def start_sudo():
     return stop
 
 
+def stay_awake():
+    """Block sleep while the script runs: a sleeping machine freezes every
+    install and benchmark (and spoils benchmark timings). systemd-inhibit
+    makes logind refuse sleep; kde-inhibit also stops KDE's idle sleep from
+    starting. The screen can still lock and turn off. Returns the helper
+    processes; ending them lifts the block (done at exit)."""
+    helpers = []
+    if DRY_RUN:
+        return helpers
+    for cmd in (["systemd-inhibit", "--what=sleep:idle", "--who=desktop post-install",
+                 "--why=Installing and benchmarking; sleep would interrupt it", "--mode=block",
+                 "sleep", "infinity"],
+                ["kde-inhibit", "--power", "sleep", "infinity"]):
+        if shutil.which(cmd[0]):
+            try:
+                helpers.append(subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL, start_new_session=True))
+            except OSError:
+                pass
+    if helpers:
+        say("Sleep is blocked while this runs (the screen can still lock and turn off).")
+    return helpers
+
+
+def let_sleep(helpers):
+    for proc in helpers:
+        proc.terminate()
+
+
 def username():
     return pwd.getpwuid(os.getuid()).pw_name
 
@@ -3073,6 +3102,7 @@ def main():
     install_copy()
     check_wheel()
     stop_sudo = start_sudo()
+    awake = stay_awake()
     try:
         if args.auth:
             banner("Sign-ins")
@@ -3145,6 +3175,7 @@ def main():
             set_autostart(True)
         fatal("interrupted. Run the same command again to continue.")
     finally:
+        let_sleep(awake)
         stop_sudo.set()
 
 
