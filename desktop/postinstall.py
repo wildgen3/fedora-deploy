@@ -42,7 +42,7 @@ Options:
     --auth              sign-ins only (skips ones already done)
     --benchmark         stage 4 only
     --check             only the validation pass, including post-reboot checks (read-only)
-    --verbose           also print every command as it runs
+    --verbose           print every command and its full output live
 
 Everything is logged to ~/postinstall-logs/. Running it twice is harmless:
 finished steps are detected and skipped. Every tweak is a separate file that
@@ -632,14 +632,32 @@ def run_tasks(title, tasks):
         fn()
 
 
-def run(cmd, changes_system=True, input_text=None, env=None):
+HEARTBEAT_SECS = 60   # "still running" notice after this long without output
+
+
+def heartbeat(shown, started, last_output, stop):
+    """Background thread: while a command runs, say so every HEARTBEAT_SECS
+    it stays quiet, with how long it's been. Shows where a run is stuck."""
+    while not stop.wait(15):
+        quiet = datetime.datetime.now() - last_output[0]
+        if quiet.total_seconds() >= HEARTBEAT_SECS:
+            mins = int((datetime.datetime.now() - started).total_seconds() // 60)
+            say(f"   ... still running ({mins} min, no output for {int(quiet.total_seconds())} s): {shown[:90]}")
+            last_output[0] = datetime.datetime.now()
+
+
+def run(cmd, changes_system=True, input_text=None, env=None, live=False):
     """Run and log one command. Returns a CompletedProcess.
 
     changes_system=True: the command modifies something. With --dry-run it is
     only printed. changes_system=False: a read-only lookup (rpm -q, dnf info,
     flatpak info, ...). Those run even in a dry run so the preview can make the
-    same decisions a real run would. Commands and their output go to the log;
-    the terminal shows them only with --verbose, or the tail when one fails.
+    same decisions a real run would.
+
+    Output always goes to the log, line by line as it arrives (so
+    `tail -f` on the log shows a running command). The terminal shows it live
+    with --verbose, or for live=True commands; otherwise only the tail if the
+    command fails. A command that goes quiet gets a "still running" notice.
     """
     shown = shlex.join(cmd)
     if DRY_RUN and changes_system:
@@ -650,29 +668,44 @@ def run(cmd, changes_system=True, input_text=None, env=None):
                 say(f"   [dry-run]     {line}")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    if VERBOSE and changes_system:
+    live = live or (VERBOSE and changes_system)
+    started = datetime.datetime.now()
+    if live or (VERBOSE and changes_system):
         say(f"   $ {shown}")
     else:
-        log(f"$ {shown}")
+        log(f"$ {shown}  [{started:%H:%M:%S}]")
+    last_output = [started]
+    stop = threading.Event()
+    if changes_system:
+        threading.Thread(target=heartbeat, args=(shown, started, last_output, stop), daemon=True).start()
     try:
-        result = subprocess.run(
-            cmd,
-            input=input_text,
-            # Empty stdin so nothing waits for input (sudo prompts via the terminal).
-            stdin=None if input_text is not None else subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            env=env,
-        )
+        if input_text is not None:
+            result = subprocess.run(cmd, input=input_text, capture_output=True, text=True,
+                                    errors="replace", env=env)
+            for line in (result.stdout + result.stderr).splitlines():
+                log(f"  | {line}")
+        else:
+            # Empty stdin: nothing can sit waiting for an answer (a question
+            # gets end-of-input instead). Output is read as it comes; \r
+            # progress bars arrive as separate lines.
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, errors="replace", env=env)
+            lines = []
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                lines.append(line)
+                last_output[0] = datetime.datetime.now()
+                if live:
+                    say(f"      | {line}")
+                else:
+                    log(f"  | {line}")
+            result = subprocess.CompletedProcess(cmd, proc.wait(), "\n".join(lines), "")
     except FileNotFoundError as err:
         result = subprocess.CompletedProcess(cmd, 127, "", str(err))
-
-    if result.stdout.strip():
-        log(result.stdout.rstrip())
-    if result.stderr.strip():
-        log(result.stderr.rstrip())
-    log(f"(exit code {result.returncode})")
+    finally:
+        stop.set()
+    secs = int((datetime.datetime.now() - started).total_seconds())
+    log(f"(exit code {result.returncode}, {secs} s)")
     if changes_system:
         FACTS["last_error"] = error_text(result) if result.returncode != 0 else ""
     if result.returncode != 0 and changes_system:
@@ -2819,12 +2852,24 @@ def stage4_baseline():
         if not tests:
             say("   No pts/ tests in the list.")
             return
-        say(f"   Tests: {', '.join(tests)} (downloaded on first use)")
-        run(["phoronix-test-suite", "batch-install", *tests])
-        env = dict(os.environ, TEST_RESULTS_NAME=name, TEST_RESULTS_IDENTIFIER="baseline",
+        say(f"   Tests: {', '.join(tests)}")
+        say("   Its own output is shown below. Downloading and building each test takes a few")
+        say("   minutes the first time, and each test runs several times for a stable result.")
+        if not pts_configured():
+            benchmark_tools_setup()  # batch mode: no questions during the run
+        # SKIP_EXTERNAL_DEPENDENCIES: don't try to install packages itself
+        # (that asks for a password and would sit waiting); the core build
+        # tools are installed already.
+        env = dict(os.environ, SKIP_EXTERNAL_DEPENDENCIES="1")
+        section("downloading and building the tests")
+        r = run(["phoronix-test-suite", "batch-install", *tests], env=env, live=True)
+        if r.returncode != 0:
+            failed("Phoronix Test Suite: installing the tests")
+        env.update(TEST_RESULTS_NAME=name, TEST_RESULTS_IDENTIFIER="baseline",
                    TEST_RESULTS_DESCRIPTION=f"Stock settings on {machine_id()}")
-        if run(["phoronix-test-suite", "batch-benchmark", *tests], env=env).returncode != 0:
-            failed("Phoronix Test Suite run (see log)")
+        section("running the tests")
+        if run(["phoronix-test-suite", "batch-benchmark", *tests], env=env, live=True).returncode != 0:
+            failed("Phoronix Test Suite: running the tests")
         if DRY_RUN:
             return
         results = HOME / ".phoronix-test-suite" / "test-results" / name
@@ -2838,8 +2883,8 @@ def stage4_baseline():
     def commands_run():
         for i, cmd in enumerate(commands, 1):
             cmd = cmd.replace("{out}", str(out))
-            say(f"   {cmd}")
-            r = run(["bash", "-c", cmd])
+            section(cmd)
+            r = run(["bash", "-c", cmd], live=True)
             if not DRY_RUN:
                 slug = re.sub(r"[^a-z0-9]+", "-", cmd.lower()).strip("-")[:40]
                 (out / f"{i:02d}-{slug}.txt").write_text(f"$ {cmd}\n\n{r.stdout}{r.stderr}")
@@ -2909,7 +2954,8 @@ def main():
                         help="turn on opt-in extras (remembered for later runs)")
     parser.add_argument("--without", action="append", metavar="NAME[,NAME]", help="turn extras off again")
     parser.add_argument("--list-options", action="store_true", help="show the opt-in extras")
-    parser.add_argument("--verbose", action="store_true", help="also print every command as it runs")
+    parser.add_argument("--verbose", action="store_true",
+                        help="print every command and its full output live (to find where something hangs)")
     args = parser.parse_args()
     DRY_RUN, VERBOSE = args.dry_run, args.verbose
 
@@ -2932,6 +2978,7 @@ def main():
     say(f"{SCRIPT} started {datetime.datetime.now():%Y-%m-%d %H:%M:%S}"
         f"{' (DRY RUN: nothing will be changed)' if DRY_RUN else ''}")
     say(f"Log: {LOG_FILE}")
+    say(f"     (watch everything live from another terminal: tail -f {LOG_FILE})")
 
     # Tools installed into ~/.local/bin (Claude, Gemini, Codex, hf) must be
     # findable even when Konsole was started by the autostart, not a login shell.
