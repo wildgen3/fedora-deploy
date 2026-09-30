@@ -641,6 +641,11 @@ def run_tasks(title, tasks):
         fn()
 
 
+def clip(line, limit=400):
+    """Long lines (web pages, minified scripts) are cut in the log."""
+    return line if len(line) <= limit else f"{line[:limit]} ... ({len(line)} characters)"
+
+
 HEARTBEAT_SECS = 60   # "still running" notice after this long without output
 
 
@@ -692,7 +697,7 @@ def run(cmd, changes_system=True, input_text=None, env=None, live=False):
             result = subprocess.run(cmd, input=input_text, capture_output=True, text=True,
                                     errors="replace", env=env)
             for line in (result.stdout + result.stderr).splitlines():
-                log(f"  | {line}")
+                log(f"  | {clip(line)}")
         else:
             # Empty stdin: nothing can sit waiting for an answer (a question
             # gets end-of-input instead). Output is read as it comes; \r
@@ -707,7 +712,7 @@ def run(cmd, changes_system=True, input_text=None, env=None, live=False):
                 if live:
                     say(f"      | {line}")
                 else:
-                    log(f"  | {line}")
+                    log(f"  | {clip(line)}")
             result = subprocess.CompletedProcess(cmd, proc.wait(), "\n".join(lines), "")
     except FileNotFoundError as err:
         result = subprocess.CompletedProcess(cmd, 127, "", str(err))
@@ -1189,7 +1194,10 @@ def rpm_installed(name):
         return name == "@virtualization" and succeeds(["rpm", "-q", "virt-manager", "qemu-kvm"])
     if ARCH.search(name):
         return succeeds(["rpm", "-q", name])  # e.g. mesa-va-drivers.i686
-    return succeeds(["rpm", "-q", "--whatprovides", name])
+    # A plain name means the 64-bit (or noarch) package: an installed 32-bit
+    # one with the same name doesn't count.
+    r = run(["rpm", "-q", "--whatprovides", "--qf", "%{ARCH}\n", name], changes_system=False)
+    return r.returncode == 0 and bool(set(r.stdout.split()) & {os.uname().machine, "noarch"})
 
 
 def install_packages(names, label):
@@ -1234,7 +1242,11 @@ def swap_package(old, new, what):
                    "Check swaps.txt, or that RPM Fusion is enabled.")
         return
     say(f"   {new}: {what}")
-    if rpm_installed(old):
+    # Swap only a real package called `old`. On newer Fedora some of these
+    # were merged into another package (Fedora 44: mesa-dri-drivers provides
+    # mesa-va-drivers); swapping would remove that whole package, so the
+    # RPM Fusion build is installed alongside instead (libva prefers it).
+    if succeeds(["rpm", "-q", old]):
         cmd = ["sudo", "dnf", "swap", "-y", old, new, "--allowerasing"]
     else:
         cmd = ["sudo", "dnf", "install", "-y", new]
@@ -1781,9 +1793,14 @@ def antigravity_published():
     html = output_of(["curl", "-fsSL", "--compressed", "--max-time", "30", ANTIGRAVITY_PAGE])
     bundles = re.findall(r"""(?:src|href)=["']([^"']+\.js)["']""", html)
     bundles.sort(key=lambda b: "main" not in b)  # the app bundle holds the download list
-    for bundle in bundles[:8]:
-        js = output_of(["curl", "-fsSL", "--compressed", "--max-time", "30",
-                        urljoin(ANTIGRAVITY_PAGE, bundle)]).replace("\\/", "/")
+    # The page itself carries the links (download buttons); its scripts are
+    # searched too in case that changes.
+    sources = [lambda: html] + [lambda b=b: output_of(["curl", "-fsSL", "--compressed", "--max-time", "30",
+                                                        urljoin(ANTIGRAVITY_PAGE, b)]) for b in bundles[:8]]
+    for fetch in sources:
+        if len(found) == len(ANTIGRAVITY):
+            break
+        js = fetch().replace("\\/", "/")
         for key, p in ANTIGRAVITY.items():
             for url in re.findall(r"https?://[^\"'\s<>)]+/linux-x64/" + p["file"], js):
                 ver = url_version(url)
@@ -2502,7 +2519,9 @@ def verify_checks():
     for dev in sorted(Path("/sys/block").glob("nvme*n*")):
         rows.append(("live", f"{dev.name} I/O scheduler none", "[none]" in read_sys(dev / "queue/scheduler")))
     if BLOCKS & {"amd-gpu", "intel-gpu"}:
-        rows.append(("live", "hardware video (vainfo)", succeeds(["vainfo", "--display", "drm"])))
+        va = output_of(["vainfo", "--display", "drm"])
+        rows.append(("live", "hardware H.264 video (vainfo)", "VAProfileH264" in va))
+        rows.append(("live", "hardware HEVC/H.265 video (vainfo)", "VAProfileHEVCMain" in va))
     if "amd-gpu" in BLOCKS:
         rows.append(("live", "GameMode AMD GPU settings", "[gpu]" in read_sys(GAMEMODE_INI)))
     rows.append(("live", "Phoronix Test Suite configured (no upload)", pts_configured()))
