@@ -93,6 +93,7 @@ OPTIONS = {
                        "framework"),
     "audio-no-powersave": ("stop audio pops/buzz from sound-chip power saving (small battery cost)",
                            "laptop"),
+    "claude-wayland": ("Claude Desktop as a native Wayland app (its launcher uses XWayland by default)", None),
 }
 
 # ---- repositories (the software's own publisher, or Fedora / RPM Fusion)
@@ -172,6 +173,23 @@ UV_TOOLS = {}           # package -> command
 AGENT_SDKS = []         # pip packages
 AGENT_IMPORTS = []      # import names checked by the validation pass
 LIST_ERRORS = []        # problems found while reading the lists
+
+# ---- Claude Desktop (community RPM of Anthropic's official app)
+
+# Anthropic ships Claude Desktop for Linux only as a .deb; the
+# claude-desktop-debian project repackages that same app as an RPM and runs
+# a signed DNF repo for it. Its key is imported only if the fingerprint
+# matches the one below, so dnf never trusts a different key on its own.
+CLAUDE_DESKTOP_REPO_URL = "https://pkg.claude-desktop-debian.dev/rpm/claude-desktop-unofficial.repo"
+CLAUDE_DESKTOP_REPO_FILE = "/etc/yum.repos.d/claude-desktop-unofficial.repo"
+CLAUDE_DESKTOP_KEY_URL = "https://pkg.claude-desktop-debian.dev/KEY.gpg"
+CLAUDE_DESKTOP_KEY_FPR = "87494CF73ACC0F23AA9557B86E29E413B912E0F1"
+CLAUDE_DESKTOP_PKG = "claude-desktop-unofficial"
+# Cowork runs its workspace in a small KVM virtual machine and needs:
+COWORK_MIN_RAM_GB = 8
+COWORK_MIN_DISK_GB = 25
+VSOCK_MODULE_FILE = "/etc/modules-load.d/vhost_vsock.conf"   # VM <-> host channel
+CLAUDE_WAYLAND_ENV = HOME / ".config" / "environment.d" / "claude-desktop.conf"
 
 # ---- Antigravity (Google)
 
@@ -405,7 +423,8 @@ SYSTEM_SERVICES = [
 USER_SERVICES = ["app-dev.lizardbyte.app.Sunshine.service"]
 # libvirt: manage VMs without a password. render/video: GPU compute (ROCm).
 # gamemode: lets GameMode change the CPU governor and GPU clocks.
-GROUPS = ["libvirt", "render", "video", "gamemode"]
+# kvm: Claude Desktop's Cowork runs its workspace VM with KVM.
+GROUPS = ["libvirt", "render", "video", "gamemode", "kvm"]
 # Opened in the default firewall zone (Fedora's desktop zone already allows
 # them; this covers other zones). Sunshine's web UI (47990) stays local-only.
 STREAMING_PORTS = {
@@ -503,6 +522,10 @@ SIGNIN_APPS = [
      "Gemini Code Assist, Codex and Cline from their sidebar icons."),
     ("Antigravity", ["google-antigravity"], "Sign in with your Google account."),
     ("Antigravity IDE", ["google-antigravity-ide", "antigravity"], "Sign in with your Google account."),
+    ("Claude", ["claude-desktop-unofficial", "claude-desktop", "claude"],
+     "Sign in. Then Settings > Cowork > Preferred browser > Built-in browser, and sign in to sites "
+     "inside the built-in browser (importing logins only works from Firefox on Linux; skip "
+     "'import cookies' for now: it can black-screen the app, bug #97234)."),
     ("ChatGPT", ["chatgpt", "ChatGPT"],
      "Sign in to your OpenAI account. Codex is in the app's sidebar (Linux preview)."),
     ("Discord", ["com.discordapp.Discord"], "Sign in."),
@@ -1540,6 +1563,7 @@ def stage2_install():
         ("VS Code extensions", install_vscode_extensions),
         ("Antigravity", install_antigravity),
         ("Google Drive mount and Docs offline", setup_google_drive),
+        ("Claude Desktop and Cowork", claude_desktop_setup),
         ("Performance tweaks", performance_tweaks),
         ("CPU and GPU", cpu_gpu_settings),
         ("Laptop and Framework", laptop_settings),
@@ -1571,6 +1595,8 @@ def setup_repos():
         else:
             failed(f"download {url}")
 
+    add_claude_desktop_repo()
+
     section("ChatGPT (its RPM adds OpenAI's signed repo)")
     if rpm_installed("chatgpt"):
         say("   already installed")
@@ -1601,6 +1627,118 @@ def setup_repos():
     section("Flathub (for your user)")
     if run(["flatpak", "remote-add", "--user", "--if-not-exists", "flathub", FLATHUB_URL]).returncode != 0:
         failed("add Flathub")
+
+
+def add_claude_desktop_repo():
+    """The Claude Desktop RPM repo, after checking its signing key's
+    fingerprint (the key is imported only on a match)."""
+    section("Claude Desktop repo (community RPM of Anthropic's app; key checked first)")
+    key_id = CLAUDE_DESKTOP_KEY_FPR[-8:].lower()
+    if succeeds(["rpm", "-q", f"gpg-pubkey-{key_id}"]):
+        say(f"   signing key 0x{key_id.upper()}: already imported")
+    else:
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            key = tmp / "KEY.gpg"
+            if run(["curl", "-fsSL", "-o", str(key), CLAUDE_DESKTOP_KEY_URL], changes_system=False).returncode != 0:
+                failed("Claude Desktop: couldn't download its signing key", CLAUDE_DESKTOP_KEY_URL)
+                return
+            listing = output_of(["gpg", "--homedir", str(tmp), "--show-keys", "--with-colons", str(key)])
+            fprs = [l.split(":")[9] for l in listing.splitlines() if l.startswith("fpr:")]
+            if CLAUDE_DESKTOP_KEY_FPR not in fprs:
+                failed("Claude Desktop: signing key fingerprint doesn't match; repo not added",
+                       f"expected {CLAUDE_DESKTOP_KEY_FPR}, got {', '.join(fprs) or 'nothing readable'}")
+                return
+            say(f"   signing key fingerprint matches ({CLAUDE_DESKTOP_KEY_FPR}); importing it")
+            if run(["sudo", "rpm", "--import", str(key)]).returncode != 0:
+                failed("Claude Desktop: import its signing key")
+                return
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if Path(CLAUDE_DESKTOP_REPO_FILE).exists():
+        say(f"   {CLAUDE_DESKTOP_REPO_FILE}: already present")
+        return
+    r = run(["curl", "-fsSL", CLAUDE_DESKTOP_REPO_URL], changes_system=False)
+    if r.returncode == 0 and "[" in r.stdout:
+        write_root_file(CLAUDE_DESKTOP_REPO_FILE, r.stdout)
+    else:
+        failed(f"download {CLAUDE_DESKTOP_REPO_URL}")
+
+
+def claude_desktop_bin():
+    """The launcher, from the package's file list (not hard-coded)."""
+    files = output_of(["rpm", "-ql", CLAUDE_DESKTOP_PKG]).splitlines()
+    return next((f for f in files if f.startswith("/usr/bin/") and "claude" in f), "")
+
+
+def kvm_ready():
+    return Path("/dev/kvm").exists()
+
+
+def vsock_ready():
+    return Path("/dev/vhost-vsock").exists() or "vhost_vsock" in read_sys("/proc/modules")
+
+
+def claude_desktop_setup():
+    """Cowork's requirements: hardware virtualization (KVM), the vhost-vsock
+    channel, QEMU/UEFI/virtiofsd (package list), the kvm group (services
+    step), and enough memory and disk."""
+    hw = FACTS["hw"]
+    section("hardware virtualization (KVM)")
+    if not ({"svm", "vmx"} & set(hw["cpu_flags"])):
+        warn("the CPU doesn't report virtualization; turn on SVM (AMD) / VT-x (Intel) in the BIOS")
+        NOTES.append("Cowork needs virtualization: turn on SVM/VT-x in the BIOS and reboot. "
+                     "Without it, COWORK_VM_BACKEND=bwrap is the fallback.")
+    elif kvm_ready():
+        say("   /dev/kvm is present")
+    else:
+        warn("/dev/kvm is missing: turn on SVM (AMD) / VT-x (Intel) in the BIOS, then reboot")
+        NOTES.append("Cowork needs /dev/kvm: turn on SVM/VT-x in the BIOS and reboot.")
+
+    section("vhost-vsock (channel between Cowork's VM and this PC)")
+    write_root_file(VSOCK_MODULE_FILE, f"# Managed by {SCRIPT}: Claude Desktop's Cowork VM channel.\nvhost_vsock\n")
+    if vsock_ready():
+        say("   loaded")
+    elif run(["sudo", "modprobe", "vhost_vsock"]).returncode != 0:
+        warn("couldn't load vhost_vsock (fallback: COWORK_VM_BACKEND=bwrap)")
+
+    section("memory and disk for Cowork's workspace")
+    ram_gb = int(re.search(r"MemTotal:\s+(\d+)", read_sys("/proc/meminfo")).group(1)) // 1024 // 1024
+    disk_gb = shutil.disk_usage(HOME).free // 1024 ** 3
+    say(f"   RAM {ram_gb} GB (needs {COWORK_MIN_RAM_GB}), free disk {disk_gb} GB (needs {COWORK_MIN_DISK_GB})")
+    if ram_gb < COWORK_MIN_RAM_GB:
+        NOTES.append(f"Cowork wants at least {COWORK_MIN_RAM_GB} GB RAM; this machine has {ram_gb} GB.")
+    if disk_gb < COWORK_MIN_DISK_GB:
+        NOTES.append(f"Cowork's workspace image needs about {COWORK_MIN_DISK_GB} GB free; {disk_gb} GB is free.")
+
+    if "claude-wayland" in ENABLED:
+        section("native Wayland (--with claude-wayland; applies from the next login)")
+        write_user_file(CLAUDE_WAYLAND_ENV, f"# Managed by {SCRIPT}: Claude Desktop as a native Wayland app.\n"
+                                            "CLAUDE_USE_WAYLAND=1\n")
+    bin_ = claude_desktop_bin()
+    say(f"   Launcher: {bin_ or CLAUDE_DESKTOP_PKG + ' (after install)'}; "
+        "`--doctor` runs in stage 3, once the kvm group is active.")
+
+
+def claude_desktop_doctor():
+    """The project's own diagnostics: display server, sandbox, MCP config,
+    stale locks, KVM/Cowork readiness, version drift."""
+    bin_ = claude_desktop_bin()
+    if not bin_ and DRY_RUN:
+        say(f"   [dry-run] {CLAUDE_DESKTOP_PKG} --doctor")
+        return
+    if not bin_:
+        failed(f"Claude Desktop: {CLAUDE_DESKTOP_PKG} isn't installed, so --doctor can't run")
+        return
+    try:
+        active = {grp.getgrgid(g).gr_name for g in os.getgroups()}
+    except KeyError:
+        active = set()
+    if "kvm" not in active:
+        say("   (the kvm group isn't active in this session yet; log out and in if Cowork complains)")
+    r = run([bin_, "--doctor"], live=True)
+    if r.returncode != 0:
+        failed("Claude Desktop --doctor reported problems (its output is above and in the log)")
 
 
 def install_swaps():
@@ -2525,6 +2663,8 @@ def verify_checks():
     if "amd-gpu" in BLOCKS:
         rows.append(("live", "GameMode AMD GPU settings", "[gpu]" in read_sys(GAMEMODE_INI)))
     rows.append(("live", "Phoronix Test Suite configured (no upload)", pts_configured()))
+    rows.append(("live", "KVM for Cowork (/dev/kvm)", kvm_ready()))
+    rows.append(("live", "vhost-vsock for Cowork", vsock_ready()))
     if "laptop" in BLOCKS:
         rows.append(("live", "sleep mode s2idle", "[s2idle]" in read_sys("/sys/power/mem_sleep")))
     if "hibernate" in BLOCKS:
@@ -2600,6 +2740,7 @@ def stage3_configure():
         ("Displays: variable refresh rate", displays_vrr),
         ("Benchmark tools (Phoronix Test Suite, MangoHud logging)", benchmark_tools_setup),
         ("Hibernation: lid action and test", hibernate_finish),
+        ("Claude Desktop check (--doctor)", claude_desktop_doctor),
         ("Sign-ins", signins),
         ("API keys for the agent SDKs", api_keys),
         ("Apps that need a sign-in", open_apps),

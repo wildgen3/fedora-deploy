@@ -29,9 +29,16 @@ remmina-plugins-kwallet?    # direct KWallet plugin (not in every release)
 @virtualization         # QEMU/KVM, libvirt and virt-manager
 swtpm                   # virtual TPM chip (Windows 11 needs one)
 swtpm-tools             # swtpm setup tools
-edk2-ovmf               # UEFI firmware for VMs
+edk2-ovmf               # UEFI firmware for VMs (Windows, and Claude Desktop's Cowork VM)
 virtio-win              # Windows VM drivers ISO (virtio-win repo)
 
 [Google Drive mount]
 rclone                  # mounts Google Drive at ~/GoogleDrive
 fuse3                   # lets rclone mount it as a normal folder
+
+[Claude Desktop]
+claude-desktop-unofficial   # Claude Desktop: Anthropic's official app, repackaged as an RPM by the claude-desktop-debian project (repo key fingerprint-checked)
+
+[Cowork VM]
+qemu-system-x86             # QEMU: runs Cowork's workspace virtual machine
+virtiofsd                   # shares folders between Cowork's VM and this PC
