@@ -279,6 +279,21 @@ agents() {{
 TIME_LOCALE = "en_GB.UTF-8"
 CLOCK_APPLETS_FILE = HOME / ".config" / "plasma-org.kde.plasma.desktop-appletsrc"
 
+# ---- KDE desktop preferences (stage 2)
+
+# Touchpads (kcminputrc [Libinput][Defaults][Touchpad]: every touchpad, also
+# ones connected later, unless System Settings has its own entry for it):
+#   NaturalScroll=true  content follows your fingers
+#   ClickMethod=2       right-click = press anywhere with two fingers
+#                       (libinput "clickfinger"; 1 = press the bottom-right corner)
+TOUCHPAD_DEFAULTS = {"NaturalScroll": "true", "ClickMethod": "2"}
+# Natural scrolling for mouse wheels too (off: mice keep the usual direction).
+NATURAL_SCROLL_MICE = False
+# Bottom panel: docked to the screen edge instead of floating.
+PANEL_FLOATING = False
+PANEL_SCRIPT = ('panels().forEach(function (p) { if (p.location == "bottom") p.floating = %s; });'
+                % ("true" if PANEL_FLOATING else "false"))
+
 # ---- performance tweaks (drop-in files: delete one to revert it)
 
 SYSCTL_FILE = "/etc/sysctl.d/99-performance.conf"
@@ -1471,6 +1486,83 @@ def set_24h_time():
     say("   The panel clock switches after the reboot at the end of this stage.")
 
 
+def kwin_devices():
+    """Input devices KWin knows (sysfs names like event5), from its D-Bus API."""
+    out = output_of(["busctl", "--user", "get-property", "org.kde.KWin", "/org/kde/KWin/InputDevice",
+                     "org.kde.KWin.InputDeviceManager", "devicesSysNames"])
+    return re.findall(r'"([^"]+)"', out)
+
+
+def kwin_device(sysname, prop):
+    """One property of a KWin input device, as text ('true', 'false', a name)."""
+    out = output_of(["busctl", "--user", "get-property", "org.kde.KWin", f"/org/kde/KWin/InputDevice/{sysname}",
+                     "org.kde.KWin.InputDevice", prop])
+    return out.split(" ", 1)[1].strip('"') if " " in out else ""
+
+
+def set_kwin_device(sysname, prop, value):
+    """Change it live; KWin also saves it for that device in kcminputrc."""
+    return run(["busctl", "--user", "set-property", "org.kde.KWin", f"/org/kde/KWin/InputDevice/{sysname}",
+                "org.kde.KWin.InputDevice", prop, "b", value]).returncode == 0
+
+
+def bottom_panels_floating():
+    """{panel id: floating?} for the panels on the bottom edge, from the
+    Plasma config files (location 4 = bottom; floating is on unless set to 0)."""
+    panels, group = {}, None
+    for line in read_sys(CLOCK_APPLETS_FILE).splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            group = line[1:-1].split("][")
+        elif group and len(group) == 2 and group[0] == "Containments" and line == "location=4":
+            panels[group[1]] = None
+    for pid in panels:
+        value = kread("plasmashellrc", ["PlasmaViews", f"Panel {pid}"], "floating")
+        panels[pid] = value != "0"
+    return panels
+
+
+def touchpad_defaults_set():
+    return all(kread("kcminputrc", ["Libinput", "Defaults", "Touchpad"], k) == v
+               for k, v in TOUCHPAD_DEFAULTS.items())
+
+
+def kde_preferences():
+    """Touchpad natural scrolling, two-finger-press right-click, and a
+    non-floating bottom panel. Saved in KDE's config and applied live."""
+    section("touchpads: natural scrolling; right-click = press anywhere with two fingers")
+    for key, value in TOUCHPAD_DEFAULTS.items():
+        kwrite("kcminputrc", ["Libinput", "Defaults", "Touchpad"], key, value)
+    if NATURAL_SCROLL_MICE:
+        kwrite("kcminputrc", ["Libinput", "Defaults", "Pointer"], "NaturalScroll", "true")
+    touchpads = 0
+    for dev in kwin_devices():
+        is_touchpad = kwin_device(dev, "touchpad") == "true"
+        if not (is_touchpad or (NATURAL_SCROLL_MICE and kwin_device(dev, "pointer") == "true")):
+            continue
+        touchpads += is_touchpad
+        name = kwin_device(dev, "name") or dev
+        if kwin_device(dev, "supportsNaturalScroll") == "true" and kwin_device(dev, "naturalScroll") != "true":
+            if set_kwin_device(dev, "naturalScroll", "true"):
+                say(f"   {name}: natural scrolling on")
+        if (is_touchpad and kwin_device(dev, "supportsClickMethodClickfinger") == "true"
+                and kwin_device(dev, "clickMethodClickfinger") != "true"):
+            if set_kwin_device(dev, "clickMethodClickfinger", "true"):
+                say(f"   {name}: right-click = press with two fingers")
+    if not touchpads and not DRY_RUN:
+        say("   No touchpad connected; the settings apply to any touchpad connected later.")
+
+    section("bottom panel: " + ("floating" if PANEL_FLOATING else "docked (not floating)"))
+    panels = bottom_panels_floating()
+    if panels and all(f == PANEL_FLOATING for f in panels.values()):
+        say("   already set")
+    elif run(["dbus-send", "--session", "--type=method_call", "--print-reply", "--dest=org.kde.plasmashell",
+              "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", f"string:{PANEL_SCRIPT}"]).returncode != 0:
+        failed("bottom panel: Plasma didn't accept the change (is the desktop session running?)")
+    elif not DRY_RUN:
+        say("   done")
+
+
 def system_update():
     say("   A full update on a fresh install can take a while.")
     ensure_ac_power("the system update")
@@ -1564,6 +1656,7 @@ def stage2_install():
         ("Antigravity", install_antigravity),
         ("Google Drive mount and Docs offline", setup_google_drive),
         ("Claude Desktop and Cowork", claude_desktop_setup),
+        ("KDE: touchpad and panel", kde_preferences),
         ("Performance tweaks", performance_tweaks),
         ("CPU and GPU", cpu_gpu_settings),
         ("Laptop and Framework", laptop_settings),
@@ -2633,6 +2726,11 @@ def collect_checks(post_reboot):
         rows.append(("group", group, user_in_group(group)))
     rows.append(("shell", "~/.bashrc.d snippet", SHELL_SNIPPET.exists()))
     rows.append(("time", f"24-hour time ({TIME_LOCALE})", time_is_24h()))
+    rows.append(("kde", "touchpads: natural scrolling, two-finger press = right-click", touchpad_defaults_set()))
+    panels = bottom_panels_floating()
+    if panels:
+        rows.append(("kde", "bottom panel " + ("floating" if PANEL_FLOATING else "not floating"),
+                     all(f == PANEL_FLOATING for f in panels.values())))
 
     if post_reboot:
         rows += verify_checks()
@@ -2692,6 +2790,7 @@ RETRY = {
     "group": setup_services,
     "shell": install_shell_config,
     "time": set_24h_time,
+    "kde": kde_preferences,
 }
 
 
