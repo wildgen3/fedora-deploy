@@ -547,12 +547,9 @@ MANGOHUD_CONF = HOME / ".config" / "MangoHud" / "MangoHud.conf"
 # (label, .desktop ids to try, what to do there)
 SIGNIN_APPS = [
     ("Google Chrome", ["google-chrome"],
-     "Sign in to Google and turn on sync. Sign in to the Bitwarden and Claude extensions "
-     "(puzzle-piece icon; pin them). Then, for offline Docs/Sheets/Slides: "
+     "Sign in to Google and turn on sync. Then, for offline Docs/Sheets/Slides: "
      "drive.google.com > Settings (gear) > Offline > turn it on. For Gmail: Gmail > "
      "Settings > See all settings > Offline."),
-    ("Firefox", ["org.mozilla.firefox", "firefox"],
-     "Sign in to the Bitwarden extension (puzzle-piece icon; pin it), and to Firefox sync if you use it."),
     ("VS Code", ["code"],
      "Accounts (bottom left) > Backup and Sync Settings. Then sign in to Claude Code, "
      "Gemini Code Assist, Codex and Cline from their sidebar icons."),
@@ -2232,7 +2229,7 @@ def browser_extensions():
     content = firefox_policy()
     if content:
         write_root_file(FIREFOX_POLICY, content)
-    say("   They install the next time each browser starts; sign in to them in stage 3.")
+    say("   They install the next time each browser starts; signing in to them is up to you.")
 
 
 def browser_extensions_set():
