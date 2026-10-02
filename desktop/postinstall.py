@@ -40,6 +40,8 @@ Options:
     --without NAME      turn one off again
     --stage N           run only stage N (1-4)
     --auth              sign-ins only (skips ones already done)
+    --drive             Google Drive only: add Google accounts (each mounted at
+                        ~/GoogleDrive/<name>), or sign one in again
     --benchmark         stage 4 only
     --check             only the validation pass, including post-reboot checks (read-only)
     --verbose           print every command and its full output live
@@ -50,6 +52,7 @@ can be deleted to revert. Only the Python standard library is used.
 """
 
 import argparse
+import base64
 import datetime
 import getpass
 import grp
@@ -67,6 +70,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+import urllib.request
 from urllib.parse import unquote, urljoin
 
 # ================================================================ settings
@@ -450,34 +454,47 @@ SUNSHINE_WEB_UI = "https://localhost:47990"
 
 # ---- Google Drive and Google Docs
 
-# Google Drive as a real folder that every app can use: rclone mounts it at
-# ~/GoogleDrive, started with your session by a systemd user service. Files are
-# cached locally as you use them (--vfs-cache-mode full), so apps can edit them
-# normally. Google Docs/Sheets/Slides show up as .docx/.xlsx/.pptx exports. The
-# service is enabled once you sign in (stage 3, or --auth later).
-GDRIVE_REMOTE = "gdrive"
+# Google Drive as real folders that every app can use: one rclone remote per
+# Google account (gdrive-<name>), each mounted at ~/GoogleDrive/<name> by its
+# own instance of a systemd user service that starts with your session. Files
+# are cached locally as you use them (--vfs-cache-mode full), so apps can edit
+# them normally. Google Docs/Sheets/Slides show up as .docx/.xlsx/.pptx
+# exports. Accounts are added at the sign-in step (stage 3, --auth, or --drive).
+GDRIVE_PREFIX = "gdrive-"
 GDRIVE_DIR = HOME / "GoogleDrive"
-GDRIVE_UNIT = "rclone-gdrive.service"
-GDRIVE_UNIT_FILE = HOME / ".config/systemd/user" / GDRIVE_UNIT
+GDRIVE_TEMPLATE = "rclone-gdrive@.service"
+GDRIVE_UNIT_FILE = HOME / ".config/systemd/user" / GDRIVE_TEMPLATE
 GDRIVE_UNIT_CONTENT = f"""\
-# Managed by {SCRIPT}. Google Drive at ~/GoogleDrive (rclone remote "{GDRIVE_REMOTE}").
+# Managed by {SCRIPT}. One instance per Google account:
+# rclone-gdrive@NAME.service mounts rclone remote "{GDRIVE_PREFIX}NAME" at ~/GoogleDrive/NAME.
 [Unit]
-Description=Google Drive at ~/GoogleDrive (rclone)
+Description=Google Drive "%i" at ~/GoogleDrive/%i (rclone)
 
 [Service]
 # rclone tells systemd when the mount is ready.
 Type=notify
-ExecStartPre=/usr/bin/mkdir -p %h/GoogleDrive
-ExecStart=/usr/bin/rclone mount {GDRIVE_REMOTE}: %h/GoogleDrive \\
+ExecStartPre=/usr/bin/mkdir -p %h/GoogleDrive/%i
+ExecStart=/usr/bin/rclone mount {GDRIVE_PREFIX}%i: %h/GoogleDrive/%i \\
     --vfs-cache-mode full --vfs-cache-max-size 20G --vfs-cache-max-age 720h \\
     --dir-cache-time 1h --poll-interval 1m
-ExecStop=/usr/bin/fusermount3 -uz %h/GoogleDrive
+ExecStop=/usr/bin/fusermount3 -uz %h/GoogleDrive/%i
 Restart=on-failure
 RestartSec=15
 
 [Install]
 WantedBy=default.target
 """
+# Earlier versions: a single remote "gdrive" at ~/GoogleDrive. Moved to the
+# per-account layout at the next sign-in.
+GDRIVE_OLD_REMOTE = "gdrive"
+GDRIVE_OLD_UNIT = "rclone-gdrive.service"
+# Which Google account a remote is signed in to (shown after each sign-in).
+DRIVE_ABOUT_URL = "https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)"
+
+
+def gdrive_unit(name):
+    return f"rclone-gdrive@{name}.service"
+
 
 # Google's "Google Docs Offline" extension, pre-installed through a Chrome
 # policy file. normal_installed: installed for you, but you can still remove
@@ -567,9 +584,6 @@ SIGNIN_APPS = [
      "Sign in. Settings > Compatibility: turn on Steam Play for all titles. "
      "Settings > Remote Play: turn it on."),
     ("Obsidian", ["md.obsidian.Obsidian"], "Open or create a vault; sign in if you use Sync."),
-    ("Lychee Slicer", ["io.mango3d.LycheeSlicer"], "Sign in to your Mango3D account."),
-    ("OrcaSlicer", ["com.orcaslicer.OrcaSlicer"], "Pick your printers; sign in if you use cloud printing."),
-    ("OBS Studio", ["com.obsproject.Studio"], "Run the auto-configuration wizard."),
 ]
 
 APP_DIRS = [HOME / ".local/share/flatpak/exports/share/applications",
@@ -589,6 +603,8 @@ MANUAL_TODO = [
     "Windows VM: download the Windows 11 ISO from microsoft.com. In virt-manager, choose "
     "'Microsoft Windows 11' as the OS (adds UEFI + TPM), and attach "
     "/usr/share/virtio-win/virtio-win.iso as a second CD for the drivers.",
+    f"Tailscale (installed, not signed in): when you want this PC on your tailnet, run "
+    f"`sudo tailscale up --operator={pwd.getpwuid(os.getuid()).pw_name}` and open the link it prints.",
     "Local AI test: `ollama run llama3.2` and `ramalama run llama3.2`; keep whichever is faster.",
     "Antigravity IDE: add extensions from its own store (it doesn't share VS Code's).",
     f"Antigravity updates: when it says a new version is out, run "
@@ -2185,13 +2201,15 @@ Categories=Development;IDE;
 
 def setup_google_drive():
     write_user_file(GDRIVE_UNIT_FILE, GDRIVE_UNIT_CONTENT)
+    gdrive_migrate(interactive_ok=False)
     run(["systemctl", "--user", "daemon-reload"])
-    if gdrive_signed_in():
-        # Already signed in (a re-run): make sure the mount starts with the session.
-        if not unit_enabled(GDRIVE_UNIT, user=True):
-            run(["systemctl", "--user", "enable", "--now", GDRIVE_UNIT])
-    else:
-        say("   The mount starts once you sign in to Google Drive (stage 3, or --auth).")
+    accounts = gdrive_accounts()
+    for name, conf in accounts.items():
+        # Already signed in (a re-run): make sure each mount starts with the session.
+        if conf.get("token") and not unit_enabled(gdrive_unit(name), user=True):
+            gdrive_mount(name)
+    if not accounts:
+        say("   Drives are mounted once you sign in to Google (stage 3, --auth or --drive).")
     for key, (name, url, icon) in GOOGLE_APPS.items():
         write_user_file(HOME / ".local/share/applications" / f"{key}.desktop", f"""\
 [Desktop Entry]
@@ -2749,6 +2767,10 @@ def collect_checks(post_reboot):
                      bool(have_ver) and version_key(have_ver) >= version_key(want)))
 
     rows.append(("google", "Drive mount service file", GDRIVE_UNIT_FILE.exists()))
+    for name, conf in gdrive_accounts().items():
+        if conf.get("token"):
+            rows.append(("google", f"Drive '{name}' mounted at ~/GoogleDrive/{name}",
+                         os.path.ismount(GDRIVE_DIR / name)))
     rows.append(("browser", "Chrome and Firefox extension policies", browser_extensions_set()))
     for key, (name, _, _) in GOOGLE_APPS.items():
         rows.append(("google", f"{name} menu entry",
@@ -3078,34 +3100,283 @@ def hf_login():
     interactive(["hf", "auth", "login"])
 
 
-def tailscale_login():
-    say("   Open the link it prints to add this PC to your tailnet.")
-    say(f"   --operator={username()} lets you run tailscale without sudo from now on.")
-    interactive(["sudo", "tailscale", "up", f"--operator={username()}"])
+def rclone_dump():
+    """{remote: settings} from rclone's config, tokens included. Read directly
+    so the tokens never reach the log or the screen."""
+    if not shutil.which("rclone"):
+        return {}
+    try:
+        r = subprocess.run(["rclone", "config", "dump"], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=60)
+        data = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def gdrive_accounts():
+    """{name: rclone settings} for each Google account (remote gdrive-<name>)."""
+    return {remote[len(GDRIVE_PREFIX):]: conf for remote, conf in rclone_dump().items()
+            if remote.startswith(GDRIVE_PREFIX) and isinstance(conf, dict) and conf.get("type") == "drive"}
 
 
 def gdrive_signed_in():
-    """True once the rclone remote for Google Drive exists."""
-    return f"{GDRIVE_REMOTE}:" in output_of(["rclone", "listremotes"]).split()
+    """True when there is at least one account, and every account has a token
+    and its mount enabled."""
+    accounts = gdrive_accounts()
+    return bool(accounts) and all(conf.get("token") and unit_enabled(gdrive_unit(name), user=True)
+                                  for name, conf in accounts.items())
 
 
-def gdrive_login():
-    if not gdrive_signed_in():
-        say("   Your browser opens to let rclone use your Google Drive.")
+def rclone_private(args, shown):
+    """rclone with a token on its command line or in its output: the log and
+    the screen get `shown` and rclone's error text, never the token."""
+    if DRY_RUN:
+        say(f"   [dry-run] {shown}")
+        return True
+    log(f"$ {shown}")
+    try:
+        r = subprocess.run(["rclone", *args], stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, errors="replace", timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        failed(shown, str(err))
+        return False
+    log(f"(exit code {r.returncode})")
+    if r.returncode != 0:
+        failed(shown, r.stderr.strip()[-1000:])   # rclone's own error lines (no token)
+    return r.returncode == 0
+
+
+TOKEN_START, TOKEN_END = "--->", "<---End paste"   # around the token in `rclone authorize` output
+
+
+def parse_rclone_token(text):
+    """The OAuth token from `rclone authorize` as compact JSON ('' if none).
+    rclone prints the token JSON; base64-encoded JSON is accepted too."""
+    text = "".join(text.split())
+    candidates = [text]
+    try:
+        padded = text.replace("+", "-").replace("/", "_") + "=" * (-len(text) % 4)
+        candidates.append(base64.urlsafe_b64decode(padded).decode())
+    except (ValueError, UnicodeDecodeError):
+        pass
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        token = data.get("token", data) if isinstance(data, dict) else None
+        if isinstance(token, str):
+            try:
+                token = json.loads(token)
+            except ValueError:
+                continue
+        if isinstance(token, dict) and token.get("access_token"):
+            return json.dumps(token, separators=(",", ":"))
+    return ""
+
+
+def rclone_authorize(client):
+    """Google's sign-in in the browser, through rclone. Returns the token
+    JSON, or '' if the sign-in wasn't finished. rclone's messages (including
+    the link, if the browser doesn't open) are shown; the token isn't."""
+    shown = "rclone authorize drive" + (" <client id> <client secret>" if client else "")
+    if DRY_RUN:
+        say(f"   [dry-run] {shown}")
+        return ""
+    log(f"$ {shown}")
+    try:
+        proc = subprocess.Popen(["rclone", "authorize", "drive", *client], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace")
+    except OSError as err:
+        failed(shown, str(err))
+        return ""
+    grabbing, blob, lines = False, [], []
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if TOKEN_END in line:
+                grabbing = False
+            elif grabbing:
+                blob.append(line)
+            elif line.rstrip().endswith(TOKEN_START):
+                grabbing = True
+            else:
+                lines.append(line)
+                say(f"      | {line}")
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        proc.wait()
+        say("   cancelled")
+        return ""
+    log(f"(exit code {rc})")
+    token = parse_rclone_token("\n".join(blob)) if rc == 0 else ""
+    if not token:
+        failed("Google sign-in (rclone authorize)",
+               "\n".join(lines[-6:]) or "no token came back; the browser sign-in wasn't finished")
+    return token
+
+
+def gdrive_email(name):
+    """The Google account a drive is signed in to ('' if it can't be read)."""
+    try:
+        access = json.loads(gdrive_accounts()[name]["token"])["access_token"]
+        req = urllib.request.Request(DRIVE_ABOUT_URL, headers={"Authorization": f"Bearer {access}"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.load(resp).get("user", {}).get("emailAddress", "")
+    except (KeyError, TypeError, ValueError, OSError):
+        return ""
+
+
+def gdrive_mount(name, restart=False):
+    """Start ~/GoogleDrive/<name> now and with every session."""
+    unit, where = gdrive_unit(name), GDRIVE_DIR / name
+    run(["systemctl", "--user", "daemon-reload"])
+    run(["systemctl", "--user", "enable", unit])
+    run(["systemctl", "--user", "restart" if restart else "start", unit])
+    if DRY_RUN or os.path.ismount(where):
+        say(f"   mounted at {where}")
+        return True
+    failed(f"Google Drive mount {where}",
+           output_of(["journalctl", "--user", "-u", unit, "-n", "12", "--no-pager", "-o", "cat"])
+           or f"systemctl --user status {unit}")
+    return False
+
+
+def gdrive_connect(name, client=(), conf=None):
+    """Sign one Google account in and mount it. `conf`: the existing remote's
+    settings when signing an account in again (it keeps its own client ID)."""
+    remote = GDRIVE_PREFIX + name
+    if conf and conf.get("client_id"):
+        client = (conf["client_id"], conf.get("client_secret", ""))
+    say(f"   {name}: your browser opens Google's sign-in. Choose the account for '{name}'")
+    say("   ('Use another account' if it isn't listed), then Allow. Ctrl+C cancels.")
+    token = rclone_authorize(client)
+    if not token:
+        return False
+    settings = [f"token={token}", "config_refresh_token=false"]   # don't start a second sign-in
+    if conf is None:
+        if client:
+            settings += [f"client_id={client[0]}", f"client_secret={client[1]}"]
+        args = ["config", "create", remote, "drive", "scope=drive", *settings]
+    else:
+        args = ["config", "update", remote, *settings]
+    if not rclone_private(args, f"rclone config {args[1]} {remote} ... token=<hidden>"):
+        return False
+    return gdrive_finish(name, restart=conf is not None)
+
+
+def gdrive_finish(name, restart=False):
+    """Check the account answers (this also refreshes the saved token), show
+    which Google account it is, and mount it."""
+    remote = GDRIVE_PREFIX + name
+    if not DRY_RUN:
+        r = run(["rclone", "about", f"{remote}:"], changes_system=False)
+        if r.returncode != 0:
+            failed(f"Google Drive '{name}' doesn't answer (rclone about {remote}:)", error_text(r))
+            return False
+        email = gdrive_email(name)
+        say(f"   {name}: signed in" + (f" as {email}" if email else ""))
+    return gdrive_mount(name, restart=restart)
+
+
+def ask_drive_name(prompt, taken):
+    """A short account name: lowercase letters, digits, - and _ ('' = none)."""
+    while True:
+        name = ask(prompt).lower()
+        if not name:
+            return ""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", name):
+            say("   Use lowercase letters, digits, - and _ (it becomes the folder name).")
+        elif name in taken:
+            say(f"   '{name}' is already used.")
+        else:
+            return name
+
+
+def ask_drive_client():
+    """Optional own Google OAuth client, asked once per run; () = rclone's shared one."""
+    if "drive_client" not in FACTS:
         say("   Optional: your own Google OAuth client ID avoids the rate limits of rclone's")
         say("   shared one (guide: rclone.org/drive/#making-your-own-client-id).")
         client_id = ask("   Client ID (Enter = rclone's shared one): ")
-        extra = []
+        secret = ""
         if client_id:
             try:
                 secret = getpass.getpass("   Client secret (hidden): ").strip()
             except EOFError:
-                secret = ""
-            extra = [f"client_id={client_id}", f"client_secret={secret}"]
-        interactive(["rclone", "config", "create", GDRIVE_REMOTE, "drive", "scope=drive", *extra])
-    if gdrive_signed_in():
-        run(["systemctl", "--user", "enable", "--now", GDRIVE_UNIT])
-        say(f"   Google Drive is at {GDRIVE_DIR} (drag it to Dolphin's Places panel for quick access).")
+                pass
+        FACTS["drive_client"] = (client_id, secret) if client_id else ()
+    return FACTS["drive_client"]
+
+
+def gdrive_migrate(interactive_ok=True):
+    """Earlier versions had one remote "gdrive" at ~/GoogleDrive, mounted by
+    rclone-gdrive.service. Stop and remove that service. A "gdrive" remote
+    without a token (its sign-in never happened) is deleted; one with a token
+    is kept under a name you pick, at the sign-in step."""
+    old_unit_file = HOME / ".config/systemd/user" / GDRIVE_OLD_UNIT
+    if old_unit_file.exists():
+        section("Google Drive: replacing the single-account mount from an earlier run")
+        run(["systemctl", "--user", "disable", "--now", GDRIVE_OLD_UNIT])
+        if not DRY_RUN and os.path.ismount(GDRIVE_DIR):
+            run(["fusermount3", "-uz", str(GDRIVE_DIR)])
+        if DRY_RUN:
+            say(f"   [dry-run] would remove {old_unit_file}")
+        else:
+            old_unit_file.unlink(missing_ok=True)
+            say(f"   removed {old_unit_file}")
+        run(["systemctl", "--user", "daemon-reload"])
+    old = rclone_dump().get(GDRIVE_OLD_REMOTE)
+    if not isinstance(old, dict) or old.get("type") != "drive":
+        return
+    if old.get("token"):
+        if not interactive_ok:
+            return
+        say(f"   An earlier run signed in one drive as rclone remote '{GDRIVE_OLD_REMOTE}'.")
+        name = ask_drive_name("   Name for that account (e.g. personal; Enter = sign in fresh instead): ",
+                              gdrive_accounts())
+        if name:
+            settings = [f"token={old['token']}", "config_refresh_token=false"]
+            if old.get("client_id"):
+                settings += [f"client_id={old['client_id']}", f"client_secret={old.get('client_secret', '')}"]
+            remote = GDRIVE_PREFIX + name
+            if not rclone_private(["config", "create", remote, "drive", "scope=drive", *settings],
+                                  f"rclone config create {remote} ... token=<hidden>"):
+                return
+            if not gdrive_finish(name):
+                return
+    else:
+        say(f"   Removing rclone remote '{GDRIVE_OLD_REMOTE}' (its Google sign-in never finished).")
+    run(["rclone", "config", "delete", GDRIVE_OLD_REMOTE])
+
+
+def gdrive_login():
+    """Sign in any number of Google accounts, each mounted at ~/GoogleDrive/<name>."""
+    gdrive_migrate()
+    say("   Each Google account gets its own drive at ~/GoogleDrive/<name>.")
+    for name, conf in gdrive_accounts().items():
+        if not conf.get("token"):
+            say(f"   {name}: not signed in yet")
+            gdrive_connect(name, conf=conf)
+        elif not DRY_RUN and not succeeds(["rclone", "about", f"{GDRIVE_PREFIX}{name}:"]):
+            if yes(f"   {name}: Google doesn't accept its sign-in any more. Sign in again?"):
+                gdrive_connect(name, conf=conf)
+        elif not unit_enabled(gdrive_unit(name), user=True):
+            gdrive_mount(name)
+    while True:
+        accounts = gdrive_accounts()
+        if accounts:
+            say("   Drives: " + ", ".join(f"~/GoogleDrive/{n}" for n in accounts))
+        name = ask_drive_name("   Add a Google account? Short name for it (e.g. personal, work; "
+                              "Enter = done): ", accounts)
+        if not name:
+            break
+        gdrive_connect(name, ask_drive_client())
+    if gdrive_accounts():
+        say(f"   Tip: drag {GDRIVE_DIR} to Dolphin's Places panel for quick access.")
 
 
 def signin_items():
@@ -3124,12 +3395,9 @@ def signin_items():
         ("Gemini CLI", GEMINI_CREDS.exists, gemini_login, "Gemini CLI: run `gemini` and log in with Google"),
         ("Codex CLI", lambda: succeeds(["codex", "login", "status"]), codex_login, "codex login"),
         ("Hugging Face", lambda: succeeds(["hf", "auth", "whoami"]), hf_login, "hf auth login"),
-        ("Google Drive mount (~/GoogleDrive)",
-         lambda: gdrive_signed_in() and unit_enabled(GDRIVE_UNIT, user=True), gdrive_login,
-         f"Google Drive mount: python3 {INSTALLED_COPY} --auth (or rclone config create "
-         f"{GDRIVE_REMOTE} drive, then systemctl --user enable --now {GDRIVE_UNIT})"),
-        ("Tailscale", lambda: succeeds(["tailscale", "status"]), tailscale_login,
-         f"sudo tailscale up --operator={username()}"),
+        ("Google Drive accounts (~/GoogleDrive/<name>)", gdrive_signed_in, gdrive_login,
+         f"Google Drive: python3 {INSTALLED_COPY} --drive (signs in each Google account "
+         f"and mounts it at ~/GoogleDrive/<name>)"),
     ]
 
 
@@ -3451,6 +3719,8 @@ def main():
                         help="print every command that would change the system, without running it")
     parser.add_argument("--stage", type=int, choices=(1, 2, 3, 4), help="run only this stage")
     parser.add_argument("--auth", action="store_true", help="sign-ins only")
+    parser.add_argument("--drive", action="store_true",
+                        help="Google Drive only: add Google accounts, or sign one in again")
     parser.add_argument("--benchmark", action="store_true", help="baseline benchmarks only (stage 4)")
     parser.add_argument("--check", action="store_true", help="validation only, including post-reboot checks")
     parser.add_argument("--with", dest="with_", action="append", metavar="NAME[,NAME]",
@@ -3505,6 +3775,10 @@ def main():
             signins()
             api_keys()
             open_apps()
+            write_todo()
+        elif args.drive:
+            banner("Google Drive accounts")
+            gdrive_login()
             write_todo()
         elif args.benchmark:
             stage4_baseline()

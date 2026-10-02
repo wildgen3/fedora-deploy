@@ -29,6 +29,7 @@ After each reboot, Konsole opens by itself once you log in and continues. You ca
 | `--dry-run` | Print what would change |
 | `--check` | Validation table, including post-reboot checks (read-only) |
 | `--auth` | Sign-ins only; finished ones are skipped |
+| `--drive` | Google Drive only: add Google accounts, or sign one in again |
 | `--benchmark` | Stage 4 only |
 | `--stage N` | Run only stage 1–4 |
 | `--with NAME[,NAME]` / `--without NAME` | Turn opt-in extras on or off (remembered); `--list-options` shows them |
@@ -62,8 +63,8 @@ The package lists are the `.txt` files in [`packages/`](packages/), one line per
 | AI | ChatGPT desktop (with Codex); Claude Code, Gemini CLI, Codex CLI, `hf`; agent SDKs in `~/.venvs/agents` | OpenAI repo; Anthropic installer, npm, uv |
 | Local AI | ollama, ramalama, llama.cpp (+ ROCm on AMD) | Fedora |
 | Cloud | Google Cloud CLI, GKE auth plugin, kubectl, skaffold | Google repo |
-| Google Drive and Docs | Drive mounted at `~/GoogleDrive` (rclone), Docs Offline extension, Docs/Sheets/Slides/Gmail/Drive menu entries | Fedora; Chrome policy |
-| Remote | Remmina, Tailscale | Fedora; Tailscale repo |
+| Google Drive and Docs | Each Google account's Drive mounted at `~/GoogleDrive/<name>` (rclone), Docs Offline extension, Docs/Sheets/Slides/Gmail/Drive menu entries | Fedora; Chrome policy |
+| Remote | Remmina, Tailscale (installed and running; sign in when you want it, see the to-do list) | Fedora; Tailscale repo |
 | Virtual machines | QEMU/KVM, libvirt, virt-manager, swtpm, UEFI, virtio-win | Fedora; virtio-win repo |
 | Core (first) | git, git-lfs, gh, CLI tools, Python 3.13, uv, Node + npm, gcc/make, podman | Fedora |
 | Gaming | Steam (RPM Fusion, with its 32-bit libraries), ProtonPlus, GameMode, MangoHud, gamescope, vkBasalt, Sunshine, Moonlight, OBS + VkCapture | RPM Fusion; Fedora; Flathub; Sunshine's COPR |
@@ -111,6 +112,7 @@ cat /sys/power/mem_sleep /sys/power/state; swapon --show; mokutil --sb-state
 ## Notes
 
 - **API keys** go in `~/.config/api-keys.env` (mode 600) and are loaded only by `agents`. Exported globally, they would make the Claude, Gemini and Codex CLIs bill the key instead of your subscription.
+- **Google Drive, several accounts:** at the sign-in step (or `--drive` later), give each Google account a short name such as `personal` or `work`. Your browser opens Google's sign-in for it; pick that account (Use another account if it isn't listed). Each one becomes its own rclone remote `gdrive-<name>`, mounted at `~/GoogleDrive/<name>` by `rclone-gdrive@<name>.service`, which starts with your session. The script then checks that the drive answers and shows which Google account it is signed in to. Run `--drive` again to add another account, or to sign one in again if Google stops accepting it. To remove one: `systemctl --user disable --now rclone-gdrive@<name>` and `rclone config delete gdrive-<name>`.
 - **Antigravity** is installed from Google's Linux download to `~/.local/opt`. Those copies can't update themselves, so when Antigravity says an update is out, run `--stage 2` again.
 - **Steam Deck streaming:** install Moonlight on the Deck from Discover, then pair it with Sunshine at `https://localhost:47990`. Steam Remote Play works too.
 - **MangoHud logs** go to `~/benchmarks/<machine>/mangohud` (Shift_L+F2 to start and stop).
