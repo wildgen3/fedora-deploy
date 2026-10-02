@@ -483,10 +483,28 @@ WantedBy=default.target
 # policy file. normal_installed: installed for you, but you can still remove
 # it. (Any policy file makes Chrome show "Managed by your organization".)
 DOCS_OFFLINE_EXTENSION = "ghbmnnjooekpmoecnnnilnnbdlolhkhi"
+
+# ---- browser extensions, pre-installed through each browser's policy file.
+# normal_installed: installed and kept updated from the official store, but
+# you can still remove them. (A policy file makes the browser say it's
+# "managed by your organization"; that's these files.)
+# Chrome Web Store IDs:
+CHROME_EXTENSIONS = {
+    DOCS_OFFLINE_EXTENSION: "Google Docs Offline",
+    "nngceckbapebfimnlniiiahkandclblb": "Bitwarden",
+    "fcoeoabgfenejglbffodgkkbkcdhcgfn": "Claude (Claude in Chrome, Anthropic)",
+}
 CHROME_POLICY = "/etc/opt/chrome/policies/managed/desktop-postinstall.json"
-CHROME_POLICY_CONTENT = json.dumps({"ExtensionSettings": {DOCS_OFFLINE_EXTENSION: {
+CHROME_POLICY_CONTENT = json.dumps({"ExtensionSettings": {ext: {
     "installation_mode": "normal_installed",
-    "update_url": "https://clients2.google.com/service/update2/crx"}}}, indent=2) + "\n"
+    "update_url": "https://clients2.google.com/service/update2/crx"} for ext in CHROME_EXTENSIONS}},
+    indent=2) + "\n"
+# Firefox add-on IDs and their addons.mozilla.org names. Anthropic makes no
+# Firefox version of the Claude extension, so Firefox gets Bitwarden only.
+FIREFOX_EXTENSIONS = {
+    "{446900e4-71c2-419f-a6a7-df9c091e268b}": ("Bitwarden", "bitwarden-password-manager"),
+}
+FIREFOX_POLICY = "/etc/firefox/policies/policies.json"
 
 # Menu entries that open Google apps in their own Chrome window (--app).
 GOOGLE_APPS = {
@@ -529,9 +547,12 @@ MANGOHUD_CONF = HOME / ".config" / "MangoHud" / "MangoHud.conf"
 # (label, .desktop ids to try, what to do there)
 SIGNIN_APPS = [
     ("Google Chrome", ["google-chrome"],
-     "Sign in to Google and turn on sync. Then, for offline Docs/Sheets/Slides: "
+     "Sign in to Google and turn on sync. Sign in to the Bitwarden and Claude extensions "
+     "(puzzle-piece icon; pin them). Then, for offline Docs/Sheets/Slides: "
      "drive.google.com > Settings (gear) > Offline > turn it on. For Gmail: Gmail > "
      "Settings > See all settings > Offline."),
+    ("Firefox", ["org.mozilla.firefox", "firefox"],
+     "Sign in to the Bitwarden extension (puzzle-piece icon; pin it), and to Firefox sync if you use it."),
     ("VS Code", ["code"],
      "Accounts (bottom left) > Backup and Sync Settings. Then sign in to Claude Code, "
      "Gemini Code Assist, Codex and Cline from their sidebar icons."),
@@ -1655,6 +1676,7 @@ def stage2_install():
         ("VS Code extensions", install_vscode_extensions),
         ("Antigravity", install_antigravity),
         ("Google Drive mount and Docs offline", setup_google_drive),
+        ("Browser extensions (Bitwarden, Claude, Docs Offline)", browser_extensions),
         ("Claude Desktop and Cowork", claude_desktop_setup),
         ("KDE: touchpad and panel", kde_preferences),
         ("Performance tweaks", performance_tweaks),
@@ -2173,7 +2195,6 @@ def setup_google_drive():
             run(["systemctl", "--user", "enable", "--now", GDRIVE_UNIT])
     else:
         say("   The mount starts once you sign in to Google Drive (stage 3, or --auth).")
-    write_root_file(CHROME_POLICY, CHROME_POLICY_CONTENT)
     for key, (name, url, icon) in GOOGLE_APPS.items():
         write_user_file(HOME / ".local/share/applications" / f"{key}.desktop", f"""\
 [Desktop Entry]
@@ -2184,6 +2205,40 @@ Icon={icon}
 Terminal=false
 Categories=Office;Network;
 """)
+
+
+# ---------------------------------------------------------------- browser extensions
+
+def firefox_policy():
+    """Firefox's policies.json with our extensions added; any policies
+    already in the file are kept."""
+    try:
+        data = json.loads(read_sys(FIREFOX_POLICY) or "{}")
+    except ValueError:
+        warn(f"{FIREFOX_POLICY} isn't valid JSON; leaving it alone")
+        return None
+    settings = data.setdefault("policies", {}).setdefault("ExtensionSettings", {})
+    for ext, (_, slug) in FIREFOX_EXTENSIONS.items():
+        settings[ext] = {"installation_mode": "normal_installed",
+                         "install_url": f"https://addons.mozilla.org/firefox/downloads/latest/{slug}/latest.xpi"}
+    return json.dumps(data, indent=2) + "\n"
+
+
+def browser_extensions():
+    section("Chrome: " + ", ".join(CHROME_EXTENSIONS.values()))
+    write_root_file(CHROME_POLICY, CHROME_POLICY_CONTENT)
+    section("Firefox: " + ", ".join(name for name, _ in FIREFOX_EXTENSIONS.values())
+            + " (Anthropic makes no Firefox version of the Claude extension)")
+    content = firefox_policy()
+    if content:
+        write_root_file(FIREFOX_POLICY, content)
+    say("   They install the next time each browser starts; sign in to them in stage 3.")
+
+
+def browser_extensions_set():
+    chrome = read_sys(CHROME_POLICY)
+    firefox = read_sys(FIREFOX_POLICY)
+    return all(e in chrome for e in CHROME_EXTENSIONS) and all(e in firefox for e in FIREFOX_EXTENSIONS)
 
 
 # ---------------------------------------------------------------- performance tweaks
@@ -2697,7 +2752,7 @@ def collect_checks(post_reboot):
                      bool(have_ver) and version_key(have_ver) >= version_key(want)))
 
     rows.append(("google", "Drive mount service file", GDRIVE_UNIT_FILE.exists()))
-    rows.append(("google", "Docs Offline extension policy", Path(CHROME_POLICY).exists()))
+    rows.append(("browser", "Chrome and Firefox extension policies", browser_extensions_set()))
     for key, (name, _, _) in GOOGLE_APPS.items():
         rows.append(("google", f"{name} menu entry",
                      (HOME / ".local/share/applications" / f"{key}.desktop").exists()))
@@ -2784,6 +2839,7 @@ RETRY = {
     "vscode": install_vscode_extensions,
     "antigravity": install_antigravity,
     "google": setup_google_drive,
+    "browser": browser_extensions,
     "tweaks": performance_tweaks,
     "kernel": cpu_gpu_settings,
     "service": setup_services,
@@ -3055,31 +3111,92 @@ def gdrive_login():
         say(f"   Google Drive is at {GDRIVE_DIR} (drag it to Dolphin's Places panel for quick access).")
 
 
+def signin_items():
+    """(title, is it done?, how to do it, to-do text) for each command-line
+    sign-in. Each check is read-only, so later runs can tell what's open."""
+    return [
+        ("Git name and email", lambda: bool(output_of(["git", "config", "--global", "user.email"])),
+         git_identity, 'git config --global user.name "..." ; git config --global user.email "..."'),
+        ("SSH key", SSH_KEY.exists, ssh_key, "SSH key: ssh-keygen -t ed25519"),
+        ("GitHub (gh)", lambda: succeeds(["gh", "auth", "status"]), gh_login,
+         "gh auth login --git-protocol ssh --web"),
+        ("Google Cloud (gcloud)", lambda: bool(gcloud_account()), gcloud_login, "gcloud auth login"),
+        ("Google Cloud credentials for SDKs (ADC)", ADC_FILE.exists, gcloud_adc,
+         "gcloud auth application-default login"),
+        ("Claude Code", lambda: succeeds([claude_cmd(), "auth", "status"]), claude_login, "claude auth login"),
+        ("Gemini CLI", GEMINI_CREDS.exists, gemini_login, "Gemini CLI: run `gemini` and log in with Google"),
+        ("Codex CLI", lambda: succeeds(["codex", "login", "status"]), codex_login, "codex login"),
+        ("Hugging Face", lambda: succeeds(["hf", "auth", "whoami"]), hf_login, "hf auth login"),
+        ("Google Drive mount (~/GoogleDrive)",
+         lambda: gdrive_signed_in() and unit_enabled(GDRIVE_UNIT, user=True), gdrive_login,
+         f"Google Drive mount: python3 {INSTALLED_COPY} --auth (or rclone config create "
+         f"{GDRIVE_REMOTE} drive, then systemctl --user enable --now {GDRIVE_UNIT})"),
+        ("Tailscale", lambda: succeeds(["tailscale", "status"]), tailscale_login,
+         f"sudo tailscale up --operator={username()}"),
+    ]
+
+
 def signins():
     say("   Each item is checked first; finished ones are skipped. Answer n to skip one.")
-    signin("Git name and email",
-           lambda: bool(output_of(["git", "config", "--global", "user.email"])),
-           git_identity,
-           'git config --global user.name "..." ; git config --global user.email "..."')
-    signin("SSH key", SSH_KEY.exists, ssh_key,
-           "SSH key: ssh-keygen -t ed25519")
-    signin("GitHub (gh)", lambda: succeeds(["gh", "auth", "status"]), gh_login,
-           "gh auth login --git-protocol ssh --web")
-    signin("Google Cloud (gcloud)", lambda: bool(gcloud_account()), gcloud_login,
-           "gcloud auth login")
-    signin("Google Cloud credentials for SDKs (ADC)", ADC_FILE.exists, gcloud_adc,
-           "gcloud auth application-default login")
-    signin("Claude Code", lambda: succeeds([claude_cmd(), "auth", "status"]), claude_login,
-           "claude auth login")
-    signin("Gemini CLI", GEMINI_CREDS.exists, gemini_login, "Gemini CLI: run `gemini` and log in with Google")
-    signin("Codex CLI", lambda: succeeds(["codex", "login", "status"]), codex_login, "codex login")
-    signin("Hugging Face", lambda: succeeds(["hf", "auth", "whoami"]), hf_login, "hf auth login")
-    signin("Google Drive mount (~/GoogleDrive)",
-           lambda: gdrive_signed_in() and unit_enabled(GDRIVE_UNIT, user=True), gdrive_login,
-           f"Google Drive mount: python3 {INSTALLED_COPY} --auth (or rclone config create "
-           f"{GDRIVE_REMOTE} drive, then systemctl --user enable --now {GDRIVE_UNIT})")
-    signin("Tailscale", lambda: succeeds(["tailscale", "status"]), tailscale_login,
-           f"sudo tailscale up --operator={username()}")
+    for title, is_done, action, todo_text in signin_items():
+        signin(title, is_done, action, todo_text)
+
+
+APPS_PENDING_FILE = STATE_DIR / "apps-pending"   # app sign-ins skipped so far
+
+
+def apps_pending():
+    """Apps whose sign-in was skipped or not finished on an earlier run (an
+    app's own sign-in can't be checked from outside, so this is remembered)."""
+    known = {label for label, _, _ in SIGNIN_APPS}
+    if APPS_PENDING_FILE.exists():
+        lines = read_sys(APPS_PENDING_FILE).splitlines()
+    else:
+        # Runs from before this was remembered: the Desktop to-do list has a
+        # line "label: sign-in text" for each app that was skipped.
+        todo = read_sys(TODO_FILE)
+        lines = [label for label, _, what in SIGNIN_APPS if f"[ ] {label}: {what[:30]}" in todo]
+    return [l for l in dict.fromkeys(lines) if l in known]
+
+
+def save_apps_pending(labels):
+    if DRY_RUN:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    APPS_PENDING_FILE.write_text("".join(f"{l}\n" for l in labels))
+
+
+def open_signins():
+    """Everything still open: command-line sign-ins, skipped API keys, and
+    apps skipped before. Read-only."""
+    cli = [title for title, is_done, _, _ in signin_items() if not is_done()]
+    keys = [var for var in API_KEYS if var not in read_api_keys()]
+    return cli, keys, apps_pending()
+
+
+def offer_open_signins():
+    """On a later run: list what's still open and offer to do it now."""
+    cli, keys, apps = open_signins()
+    if not (cli or keys or apps):
+        say("All sign-ins are done.")
+        return
+    banner("Sign-ins still open")
+    for title in cli:
+        say(f"   - {title}")
+    for var in keys:
+        say(f"   - {var} (optional)")
+    for label in apps:
+        say(f"   - {label} (app)")
+    if DRY_RUN or not yes("Do these now? (Each one can still be skipped.)"):
+        say(f"   Later: python3 {INSTALLED_COPY} --auth")
+        return
+    if cli:
+        signins()
+    if keys:
+        api_keys()
+    if apps:
+        open_apps(only=apps)
+    write_todo()
 
 
 def read_api_keys():
@@ -3140,14 +3257,20 @@ def find_desktop_file(ids, label):
     return None
 
 
-def open_apps():
+def open_apps(only=None):
+    """Open each app that needs a sign-in (or only the `only` ones). Skipped
+    or unfinished ones are remembered and offered again on the next run."""
     say("   Each app opens in turn. Sign in, then come back here and press Enter.")
-    say("   Type s then Enter to skip one (it goes on the to-do list).")
+    say("   Type s then Enter to skip one (it's offered again next time you run this).")
+    pending = set(apps_pending())
     for label, ids, what in SIGNIN_APPS:
+        if only is not None and label not in only:
+            continue
         section(f"{label}: {what}")
         if DRY_RUN:
             say(f"   [dry-run] would open {label} and wait for Enter")
             continue
+        pending.add(label)
         if ask("   Enter = open it, s = skip: ").lower() == "s":
             TODO.append(f"{label}: {what}")
             continue
@@ -3160,6 +3283,11 @@ def open_apps():
                          stderr=subprocess.DEVNULL, start_new_session=True)
         if ask("   Press Enter when done (s = not finished, add to to-do): ").lower() == "s":
             TODO.append(f"{label}: {what}")
+        else:
+            pending.discard(label)
+    save_apps_pending([label for label, _, _ in SIGNIN_APPS if label in pending])
+    if only is not None:
+        return
 
     section(f"Sunshine: create its admin username and password at {SUNSHINE_WEB_UI}")
     say("   (Your browser warns about the certificate: it's Sunshine's own, on this PC; continue.)")
@@ -3170,7 +3298,19 @@ def open_apps():
 
 
 def write_todo():
-    items = TODO + MANUAL_TODO
+    """The Desktop to-do list, rebuilt from what's actually still open (so a
+    sign-in finished on a later run drops off), plus the manual items."""
+    if not DRY_RUN:
+        cli, keys, apps = open_signins()
+        whats = {label: what for label, _, what in SIGNIN_APPS}
+        todo_text = {title: text for title, _, _, text in signin_items()}
+        open_now = ([todo_text[t] for t in cli]
+                    + [f"(optional) API key: create one at {API_KEYS[v]}, then add {v}=... to {API_KEYS_FILE}"
+                       for v in keys]
+                    + [f"{label}: {whats[label]}" for label in apps])
+    else:
+        open_now = []
+    items = list(dict.fromkeys(open_now + TODO + MANUAL_TODO))
     text = "Desktop post-install: things left to do\n" + "=" * 40 + "\n"
     text += "".join(f"[ ] {item}\n" for item in items)
     text += f"\nSign-ins again any time: python3 {INSTALLED_COPY} --auth\n"
@@ -3424,7 +3564,8 @@ def main():
                         summary()
                         ask_reboot("the hibernation step")
                         return
-                say("Checking everything is still installed and live.")
+                offer_open_signins()
+                say("\nChecking everything is still installed and live.")
                 say("(Sign-ins: --auth. Benchmarks: --benchmark. A single stage: --stage N.)")
                 validate(retry=True, post_reboot=True)
                 summary()
