@@ -22,11 +22,11 @@ log in and carries on where it left off (or just run the same command again):
            firmware updates (listed first, installed after you confirm;
            laptops must be on the charger), Flatpak updates. Reboot.
   Stage 2  Install ("Phase A"): repos, packages, Flatpaks, AI CLIs and SDKs,
-           VS Code extensions, Antigravity, Cherry Studio, Google Drive
-           mount, performance tweaks (sysctl, I/O schedulers, noatime,
-           ananicy-cpp, GameMode),
-           kernel arguments, GPU tooling, laptop power settings and, on a
-           Framework laptop, hibernation. Then a validation pass: every item
+           Ollama (official build), VS Code extensions, Antigravity, Cherry
+           Studio, Google Drive mount, performance tweaks (sysctl, I/O
+           schedulers, noatime, ananicy-cpp, GameMode), kernel arguments,
+           GPU tooling, laptop power settings and, on a Framework laptop,
+           hibernation. Then a validation pass: every item
            is checked, anything missing is retried once. Reboot.
   Stage 3  Configure and sign in ("Phase B"): checks that kernel arguments and
            services are live, GameMode's AMD GPU settings, variable refresh
@@ -71,6 +71,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 import urllib.request
 from urllib.parse import unquote, urljoin
@@ -151,6 +152,42 @@ CHERRY_MANIFEST = "https://github.com/CherryHQ/cherry-studio/releases/latest/dow
 CHERRY_DOWNLOAD = "https://github.com/CherryHQ/cherry-studio/releases/download/v{ver}/{file}"
 CHERRY_FALLBACK = ("2.1.4", "Cherry-Studio-2.1.4-linux-x64.rpm",
                    "nFg1frFXSuivrmf3Bzchw6MJ/S0LEf+TLkbxgjyEH10mP8nbdIOvQJUzriOAKyVawzIh0JbizB3tdOPS9bnI3g==")
+
+# Ollama: Fedora's package stays installed (and updated by dnf), and the
+# current official build from Ollama's GitHub release runs alongside it,
+# because Fedora's lags far behind and newer models need a newer Ollama. The
+# official build goes in /usr/local the way Ollama's install.sh does it, minus
+# its NVIDIA driver steps and the bundled NVIDIA CUDA libraries (~2 GB); AMD
+# GPUs get its ROCm add-on. /usr/local/bin comes first in PATH, so `ollama` is
+# the official build, and a drop-in points Fedora's ollama.service at it,
+# keeping Fedora's user, settings and model folder. Delete the drop-in (and
+# /usr/local/bin/ollama) to go back to Fedora's. Each run upgrades to the
+# latest release; downloads are checked against its sha256sum.txt. The
+# fallback is the newest release checked by hand.
+OLLAMA_LATEST = "https://github.com/ollama/ollama/releases/latest/download/sha256sum.txt"
+OLLAMA_DOWNLOAD = "https://github.com/ollama/ollama/releases/download/v{ver}/{file}"
+OLLAMA_BASE, OLLAMA_ROCM = "ollama-linux-amd64.tar.zst", "ollama-linux-amd64-rocm.tar.zst"
+OLLAMA_FALLBACK = ("0.35.1", {
+    OLLAMA_BASE: "9fcd79ac4575b2bd31b992eee18b1000c8ad126b451627c8f8cd091714cfbb10",
+    OLLAMA_ROCM: "786e1ba2ed7877b48aa948315ab704da2ea54a4b636e0ca18c3d328c84ff22cf",
+})
+OLLAMA_PREFIX = Path("/usr/local")
+OLLAMA_BIN = OLLAMA_PREFIX / "bin/ollama"
+OLLAMA_LIB = OLLAMA_PREFIX / "lib/ollama"
+OLLAMA_SKIP = "lib/ollama/cuda_v*"   # NVIDIA CUDA libraries
+OLLAMA_DROPIN = "/etc/systemd/system/ollama.service.d/20-official-build.conf"
+OLLAMA_DROPIN_CONTENT = f"""\
+# Managed by {SCRIPT}. Fedora's ollama.service runs Ollama's current official
+# build in /usr/local instead of Fedora's /usr/bin/ollama; everything else
+# (user, settings, model folder) stays Fedora's. Delete this file to go back.
+[Service]
+ExecStart=
+ExecStart={OLLAMA_BIN} serve
+# GPU access (ROCm needs /dev/kfd and /dev/dri).
+SupplementaryGroups=render video
+"""
+OLLAMA_API = "http://127.0.0.1:11434/api/version"
+
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
 REPO_URLS = {
@@ -379,7 +416,7 @@ HIP_VISIBLE_DEVICES = "quay.io/ramalama/ramalama:latest"
 ROCM_PROFILE = "/etc/profile.d/rocm-gfx-override.sh"
 ROCM_PROFILE_CONTENT = f"""\
 # Managed by {SCRIPT}. Uncomment to run ROCm apps on this RX 6600-class GPU
-# as gfx1030 (unofficial). ollama already has this set for its service.
+# as gfx1030 (unofficial). Ollama already has this set for its service.
 # export HSA_OVERRIDE_GFX_VERSION=10.3.0
 """
 
@@ -1701,6 +1738,7 @@ def stage2_install():
         ("Old Flatpak Steam cleanup", cleanup_flatpak_steam),
         ("Flatpak apps", install_flatpaks),
         ("AI command-line tools", install_cli_tools),
+        ("Ollama (official build)", install_ollama),
         ("Agent SDK environment", install_agent_sdks),
         ("Shell setup", install_shell_config),
         ("VS Code extensions", install_vscode_extensions),
@@ -2213,6 +2251,146 @@ Terminal=false
 Categories=Development;IDE;
 """)
     say(f"   Installed {p['label']} {ver} in {dest}")
+
+
+# ---------------------------------------------------------------- Ollama
+
+def ollama_published():
+    """(version, {file: sha256}) of the latest Ollama release."""
+    if "ollama" not in FACTS:
+        found = None
+        # The "latest" link redirects to the versioned one: .../download/v0.35.1/sha256sum.txt
+        head = output_of(["curl", "-sSI", "--max-time", "30", OLLAMA_LATEST])
+        m = re.search(r"/releases/download/v(\d+\.\d+\.\d+)/", head)
+        if m:
+            sums = output_of(["curl", "-fsSL", "--max-time", "30",
+                              OLLAMA_DOWNLOAD.format(ver=m.group(1), file="sha256sum.txt")])
+            files = {name: sha for sha, name in re.findall(r"^([0-9a-f]{64})\s+\*?\.?/?(\S+)$", sums, re.M)}
+            if OLLAMA_BASE in files:
+                found = (m.group(1), files)
+        if not found:
+            warn(f"couldn't read Ollama's latest release from GitHub; using the newest known "
+                 f"({OLLAMA_FALLBACK[0]})")
+            found = OLLAMA_FALLBACK
+        FACTS["ollama"] = found
+    return FACTS["ollama"]
+
+
+def ollama_installed_version():
+    """Version of the official build in /usr/local ('' if it isn't there)."""
+    if not OLLAMA_BIN.exists():
+        return ""
+    r = run([str(OLLAMA_BIN), "--version"], changes_system=False)
+    found = re.findall(r"\d+\.\d+\.\d+", r.stdout + r.stderr)
+    return found[-1] if found else ""
+
+
+def ollama_files():
+    return [OLLAMA_BASE] + ([OLLAMA_ROCM] if "amd-gpu" in BLOCKS else [])
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def ollama_server_version():
+    """Version of the Ollama server that's running ('' if none answers)."""
+    try:
+        with urllib.request.urlopen(OLLAMA_API, timeout=5) as resp:
+            return json.load(resp).get("version", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def install_ollama():
+    ver, sums = ollama_published()
+    fedora = output_of(["rpm", "-q", "--qf", "%{VERSION}", "ollama"])
+    section(f"Ollama: GitHub's latest release is {ver}; "
+            + (f"Fedora's package {fedora} stays installed" if fedora else "Fedora's package isn't installed"))
+    have = ollama_installed_version()
+    rocm_ok = "amd-gpu" not in BLOCKS or any(OLLAMA_LIB.glob("rocm*"))
+    changed = False
+    if have and version_key(have) >= version_key(ver) and rocm_ok:
+        say(f"   {have} is installed in {OLLAMA_PREFIX}: up to date")
+    else:
+        say(f"   Installing {ver}" + (f" (replacing {have})" if have else "")
+            + (" with the AMD ROCm add-on" if "amd-gpu" in BLOCKS else "")
+            + "; NVIDIA CUDA libraries left out")
+        if not install_ollama_files(ver, sums):
+            return
+        changed = True
+    ollama_service(restart=changed)
+
+
+def install_ollama_files(ver, sums):
+    """Download, check and unpack the release into /usr/local. The old
+    libraries are removed only once every download checks out."""
+    files = ollama_files()
+    if DRY_RUN:
+        for f in files:
+            say(f"   [dry-run] download {OLLAMA_DOWNLOAD.format(ver=ver, file=f)}, check its SHA-256")
+        say(f"   [dry-run] replace {OLLAMA_LIB}, unpack into {OLLAMA_PREFIX} (without {OLLAMA_SKIP})")
+        return True
+    if not shutil.which("zstd"):
+        install_packages(["zstd"], "zstd (unpacks Ollama's archives)")
+    # Several GB: /var/tmp is on disk (/tmp is in RAM).
+    tmp = Path(tempfile.mkdtemp(prefix="ollama-", dir="/var/tmp"))
+    try:
+        for f in files:
+            if f not in sums:
+                failed(f"Ollama {ver}: the release has no {f}")
+                return False
+            if run(["curl", "-fL", "--retry", "3", "-o", str(tmp / f),
+                    OLLAMA_DOWNLOAD.format(ver=ver, file=f)]).returncode != 0:
+                failed(f"download {f}")
+                return False
+            got = sha256_of(tmp / f)
+            if got != sums[f]:
+                failed(f"Ollama: {f} doesn't match the release's checksum; not installed",
+                       f"expected SHA-256 {sums[f]}\ngot     {got}")
+                return False
+        say("   checksums match the release's")
+        run(["sudo", "systemctl", "stop", "ollama.service"])
+        run(["sudo", "rm", "-rf", str(OLLAMA_LIB)])
+        for f in files:
+            if run(["sudo", "tar", "--zstd", "-xf", str(tmp / f), "-C", str(OLLAMA_PREFIX),
+                    "--no-same-owner", f"--exclude={OLLAMA_SKIP}"]).returncode != 0:
+                failed(f"unpack {f} into {OLLAMA_PREFIX}")
+                return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    say(f"   Ollama {ollama_installed_version() or ver} is in {OLLAMA_PREFIX}")
+    return True
+
+
+def ollama_service(restart=False):
+    """Point Fedora's ollama.service at the official build. Restarted only
+    when Ollama or the drop-in changed, so a re-run doesn't interrupt a
+    running model."""
+    if not unit_exists("ollama.service") and not DRY_RUN:
+        failed("ollama.service: not there (Fedora's ollama package isn't installed)")
+        return
+    if read_sys(OLLAMA_DROPIN) != OLLAMA_DROPIN_CONTENT.strip():
+        write_root_file(OLLAMA_DROPIN, OLLAMA_DROPIN_CONTENT)
+        restart = True
+    run(["sudo", "systemctl", "daemon-reload"])
+    run(["sudo", "systemctl", "enable", "ollama.service"])
+    if run(["sudo", "systemctl", "restart" if restart else "start", "ollama.service"]).returncode != 0:
+        failed("start ollama.service")
+        return
+    if DRY_RUN:
+        return
+    for _ in range(10):   # the server takes a moment to answer
+        serving = ollama_server_version()
+        if serving:
+            break
+        time.sleep(1)
+    say(f"   ollama.service is running Ollama {serving or '(not answering yet)'}; "
+        f"`ollama` is {shutil.which('ollama') or OLLAMA_BIN}")
 
 
 # ---------------------------------------------------------------- Cherry Studio
@@ -2844,6 +3022,15 @@ def collect_checks(post_reboot):
         rows.append(("antigravity", f"{p['label']} {want}",
                      bool(have_ver) and version_key(have_ver) >= version_key(want)))
 
+    ollama_ver = ollama_published()[0]
+    ollama_have = ollama_installed_version()
+    rows.append(("ollama", f"Ollama {ollama_ver} (official build in /usr/local)",
+                 bool(ollama_have) and version_key(ollama_have) >= version_key(ollama_ver)))
+    if "amd-gpu" in BLOCKS:
+        rows.append(("ollama", "Ollama ROCm add-on (AMD GPU)", any(OLLAMA_LIB.glob("rocm*"))))
+    rows.append(("ollama", "ollama.service set to run the official build", Path(OLLAMA_DROPIN).exists()))
+    rows.append(("ollama", "ollama.service serves the official build",
+                 bool(ollama_have) and ollama_server_version() == ollama_have))
     cherry_ver = cherry_published()[0]
     cherry_have = output_of(["rpm", "-q", "--qf", "%{VERSION}", CHERRY_PACKAGE])
     rows.append(("cherry", f"Cherry Studio {cherry_ver}",
@@ -2941,6 +3128,7 @@ RETRY = {
     "vscode": install_vscode_extensions,
     "antigravity": install_antigravity,
     "cherry": install_cherry_studio,
+    "ollama": install_ollama,
     "google": setup_google_drive,
     "browser": browser_extensions,
     "tweaks": performance_tweaks,
