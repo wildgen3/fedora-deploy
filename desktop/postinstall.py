@@ -22,8 +22,9 @@ log in and carries on where it left off (or just run the same command again):
            firmware updates (listed first, installed after you confirm;
            laptops must be on the charger), Flatpak updates. Reboot.
   Stage 2  Install ("Phase A"): repos, packages, Flatpaks, AI CLIs and SDKs,
-           VS Code extensions, Antigravity, Google Drive mount, performance
-           tweaks (sysctl, I/O schedulers, noatime, ananicy-cpp, GameMode),
+           VS Code extensions, Antigravity, Cherry Studio, Google Drive
+           mount, performance tweaks (sysctl, I/O schedulers, noatime,
+           ananicy-cpp, GameMode),
            kernel arguments, GPU tooling, laptop power settings and, on a
            Framework laptop, hibernation. Then a validation pass: every item
            is checked, anything missing is retried once. Reboot.
@@ -56,6 +57,7 @@ import base64
 import datetime
 import getpass
 import grp
+import hashlib
 import json
 import math
 import os
@@ -137,6 +139,18 @@ gpgkey=https://packages.cloud.google.com/yum/doc/rpm-package-key-v10.gpg
 # publishes no key URL: its first RPM installs the signing key and OpenAI's
 # signed repo, and later updates come through dnf from that repo.
 CHATGPT_RPM = "https://persistent.oaistatic.com/codex-app-prod/linux/rpm/latest/chatgpt.x86_64.rpm"
+
+# Cherry Studio: one desktop app for many AI model providers (and local
+# ollama), with assistants, agents and MCP. CherryHQ publishes an RPM with each
+# GitHub release but no dnf repo, so every run reads the current stable version
+# from the update manifest of the latest release, and installs or upgrades the
+# RPM after checking its SHA-512 against that manifest (the RPM isn't
+# GPG-signed). The fallback is the newest release checked by hand.
+CHERRY_PACKAGE = "CherryStudio"
+CHERRY_MANIFEST = "https://github.com/CherryHQ/cherry-studio/releases/latest/download/latest-linux.yml"
+CHERRY_DOWNLOAD = "https://github.com/CherryHQ/cherry-studio/releases/download/v{ver}/{file}"
+CHERRY_FALLBACK = ("2.1.4", "Cherry-Studio-2.1.4-linux-x64.rpm",
+                   "nFg1frFXSuivrmf3Bzchw6MJ/S0LEf+TLkbxgjyEH10mP8nbdIOvQJUzriOAKyVawzIh0JbizB3tdOPS9bnI3g==")
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
 REPO_URLS = {
@@ -578,6 +592,9 @@ SIGNIN_APPS = [
      "'import cookies' for now: it can black-screen the app, bug #97234)."),
     ("ChatGPT", ["chatgpt", "ChatGPT"],
      "Sign in to your OpenAI account. Codex is in the app's sidebar (Linux preview)."),
+    ("Cherry Studio", ["CherryStudio", "cherry-studio"],
+     "Settings > Model Providers: turn on the ones you use and sign in or paste their API "
+     "keys (Ollama works with no key)."),
     ("Discord", ["com.discordapp.Discord"], "Sign in."),
     ("Spotify", ["com.spotify.Client"], "Sign in."),
     ("Steam", ["steam"],
@@ -1688,6 +1705,7 @@ def stage2_install():
         ("Shell setup", install_shell_config),
         ("VS Code extensions", install_vscode_extensions),
         ("Antigravity", install_antigravity),
+        ("Cherry Studio", install_cherry_studio),
         ("Google Drive mount and Docs offline", setup_google_drive),
         ("Browser extensions (Bitwarden, Claude, Docs Offline)", browser_extensions),
         ("Claude Desktop and Cowork", claude_desktop_setup),
@@ -2195,6 +2213,66 @@ Terminal=false
 Categories=Development;IDE;
 """)
     say(f"   Installed {p['label']} {ver} in {dest}")
+
+
+# ---------------------------------------------------------------- Cherry Studio
+
+def parse_cherry_manifest(text):
+    """(version, x64 RPM file name, base64 SHA-512) from electron-builder's
+    latest-linux.yml, or None."""
+    ver = re.search(r"^version:\s*['\"]?([\w.-]+)", text, re.M)
+    rpm = re.search(r"-\s*url:\s*(\S*x(?:64|86_64)\S*\.rpm)\s*\n\s*sha512:\s*(\S+)", text)
+    return (ver.group(1), rpm.group(1), rpm.group(2)) if ver and rpm else None
+
+
+def cherry_published():
+    """The current stable release: (version, RPM file name, SHA-512)."""
+    if "cherry" not in FACTS:
+        found = parse_cherry_manifest(output_of(["curl", "-fsSL", "--max-time", "30", CHERRY_MANIFEST]))
+        if not found:
+            warn(f"couldn't read Cherry Studio's current version from {CHERRY_MANIFEST}; "
+                 f"using the newest known ({CHERRY_FALLBACK[0]})")
+            found = CHERRY_FALLBACK
+        FACTS["cherry"] = found
+    return FACTS["cherry"]
+
+
+def sha512_b64(path):
+    h = hashlib.sha512()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return base64.b64encode(h.digest()).decode()
+
+
+def install_cherry_studio():
+    ver, file, sha512 = cherry_published()
+    section(f"Cherry Studio: GitHub's latest release is {ver}")
+    have = output_of(["rpm", "-q", "--qf", "%{VERSION}", CHERRY_PACKAGE])
+    if have and version_key(have) >= version_key(ver):
+        say(f"   {have} is installed: up to date")
+        return
+    url = CHERRY_DOWNLOAD.format(ver=ver, file=file)
+    say(f"   Installing {ver}" + (f" (replacing {have})" if have else ""))
+    if DRY_RUN:
+        say(f"   [dry-run] download {url}, check its SHA-512, sudo dnf install it")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="cherry-studio-"))
+    try:
+        rpm = tmp / file
+        if run(["curl", "-fL", "--retry", "3", "-o", str(rpm), url]).returncode != 0:
+            failed("download Cherry Studio")
+            return
+        got = sha512_b64(rpm)
+        if got != sha512:
+            failed("Cherry Studio: the download doesn't match its release's checksum; not installed",
+                   f"{file}\nexpected SHA-512 {sha512}\ngot      {got}")
+            return
+        say("   checksum matches the release's")
+        if run(["sudo", "dnf", "install", "-y", str(rpm)]).returncode != 0:
+            failed(f"install Cherry Studio {ver}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- Google Drive
@@ -2766,6 +2844,11 @@ def collect_checks(post_reboot):
         rows.append(("antigravity", f"{p['label']} {want}",
                      bool(have_ver) and version_key(have_ver) >= version_key(want)))
 
+    cherry_ver = cherry_published()[0]
+    cherry_have = output_of(["rpm", "-q", "--qf", "%{VERSION}", CHERRY_PACKAGE])
+    rows.append(("cherry", f"Cherry Studio {cherry_ver}",
+                 bool(cherry_have) and version_key(cherry_have) >= version_key(cherry_ver)))
+
     rows.append(("google", "Drive mount service file", GDRIVE_UNIT_FILE.exists()))
     for name, conf in gdrive_accounts().items():
         if conf.get("token"):
@@ -2857,6 +2940,7 @@ RETRY = {
     "sdk": install_agent_sdks,
     "vscode": install_vscode_extensions,
     "antigravity": install_antigravity,
+    "cherry": install_cherry_studio,
     "google": setup_google_drive,
     "browser": browser_extensions,
     "tweaks": performance_tweaks,
