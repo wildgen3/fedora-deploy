@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop
 | Stage | What happens | Ends with |
 |---|---|---|
 | 1. Clean base | Hardware detection, system update, firmware (pending updates listed, installed after you confirm; laptops must be on the charger), Flatpak updates | Reboot |
-| 2. Install (Phase A) | Core tools first (git, CLI, code tools), then repos, codec swaps, packages, old Flatpak Steam cleanup, Flatpaks, AI CLIs and SDKs, VS Code extensions, Antigravity, Cherry Studio, Google Drive mount, performance tweaks, kernel arguments, GPU tooling, laptop power settings, Framework hibernation (swap file + resume). Then a validation pass that retries anything missing once. | Reboot |
+| 2. Install (Phase A) | Core tools first (git, CLI, code tools), then repos, codec swaps, packages, old Flatpak Steam cleanup, Flatpaks, AI CLIs and SDKs, Ollama, VS Code extensions, Antigravity, Cherry Studio, Google Drive mount, performance tweaks, kernel arguments, GPU tooling, laptop power settings, Framework hibernation (swap file + resume). Then a validation pass that retries anything missing once. | Reboot |
 | 3. Configure and sign in (Phase B) | Checks that kernel arguments and daemons are live, GameMode AMD GPU settings, variable refresh rate, Phoronix Test Suite and MangoHud logging, lid close = hibernate (Framework) with a test, every sign-in, each app | To-do file on the Desktop |
 | 4. Baseline benchmarks (Phase C) | Runs `~/.config/desktop-postinstall/benchmarks.txt` at stock settings; results go to `~/benchmarks/<machine>/` | Offered at the end of stage 3, or `--benchmark` later |
 
@@ -62,7 +62,7 @@ The package lists are the `.txt` files in [`packages/`](packages/), one line per
 | Antigravity | Antigravity (agent app) and Antigravity IDE | Google's download page, current version read on each run |
 | AI | ChatGPT desktop (with Codex); Claude Code, Gemini CLI, Codex CLI, `hf`; agent SDKs in `~/.venvs/agents` | OpenAI repo; Anthropic installer, npm, uv |
 | Cherry Studio | Desktop app for many AI model providers and local ollama (assistants, agents, MCP) | CherryHQ's RPM from its latest GitHub release, current version read on each run, SHA-512 checked |
-| Local AI | ollama, ramalama, llama.cpp (+ ROCm on AMD) | Fedora |
+| Local AI | Ollama (official build, latest release, + its ROCm add-on on AMD; its NVIDIA CUDA libraries left out), ramalama, llama.cpp (+ ROCm on AMD) | Ollama's GitHub release, SHA-256 checked; Fedora |
 | Cloud | Google Cloud CLI, GKE auth plugin, kubectl, skaffold | Google repo |
 | Google Drive and Docs | Each Google account's Drive mounted at `~/GoogleDrive/<name>` (rclone), Docs Offline extension, Docs/Sheets/Slides/Gmail/Drive menu entries | Fedora; Chrome policy |
 | Remote | Remmina, Tailscale (installed and running; sign in when you want it, see the to-do list) | Fedora; Tailscale repo |
@@ -114,6 +114,7 @@ cat /sys/power/mem_sleep /sys/power/state; swapon --show; mokutil --sb-state
 
 - **API keys** go in `~/.config/api-keys.env` (mode 600) and are loaded only by `agents`. Exported globally, they would make the Claude, Gemini and Codex CLIs bill the key instead of your subscription.
 - **Google Drive, several accounts:** at the sign-in step (or `--drive` later), give each Google account a short name such as `personal` or `work`. Your browser opens Google's sign-in for it; pick that account (Use another account if it isn't listed). Each one becomes its own rclone remote `gdrive-<name>`, mounted at `~/GoogleDrive/<name>` by `rclone-gdrive@<name>.service`, which starts with your session. The script then checks that the drive answers and shows which Google account it is signed in to. Run `--drive` again to add another account, or to sign one in again if Google stops accepting it. To remove one: `systemctl --user disable --now rclone-gdrive@<name>` and `rclone config delete gdrive-<name>`.
+- **Ollama** is the official build in `/usr/local` (as Ollama's own install.sh does it, without its NVIDIA driver steps), not Fedora's package, which is far behind. If Fedora's package is installed, it's removed after the official build is in place; downloaded models and the `ollama` user stay. dnf doesn't update it: each run of `--stage 2` upgrades it when GitHub has a newer release.
 - **Cherry Studio** has no dnf repo, so dnf doesn't update it. Each run of `--stage 2` installs a newer release if GitHub has one.
 - **Antigravity** is installed from Google's Linux download to `~/.local/opt`. Those copies can't update themselves, so when Antigravity says an update is out, run `--stage 2` again.
 - **Steam Deck streaming:** install Moonlight on the Deck from Discover, then pair it with Sunshine at `https://localhost:47990`. Steam Remote Play works too.

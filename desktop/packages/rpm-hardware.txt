@@ -2,7 +2,7 @@
 
 [AMD GPU | amd-gpu]
 lact                # AMD GPU control: clocks, undervolt, power limit, fan curves (+ lactd daemon; developer's COPR)
-rocm-hip            # ROCm runtime: ollama and other apps compute on the AMD GPU
+rocm-hip            # ROCm runtime: apps compute on the AMD GPU (Ollama brings its own)
 rocm-opencl         # OpenCL on ROCm
 rocminfo            # shows what ROCm sees
 

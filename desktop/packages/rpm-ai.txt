@@ -1,6 +1,6 @@
-# Local AI (Fedora). ROCm for AMD GPUs is in rpm-hardware.txt.
+# Local AI (Fedora). Ollama isn't here: the script installs Ollama's official
+# build from GitHub (Fedora's is far behind). ROCm for AMD GPUs is in rpm-hardware.txt.
 
 [local AI]
-ollama              # runs local language models
 ramalama            # runs local models in containers
 llama-cpp           # llama.cpp command-line tools
