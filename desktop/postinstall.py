@@ -22,11 +22,11 @@ log in and carries on where it left off (or just run the same command again):
            firmware updates (listed first, installed after you confirm;
            laptops must be on the charger), Flatpak updates. Reboot.
   Stage 2  Install ("Phase A"): repos, packages, Flatpaks, AI CLIs and SDKs,
-           Ollama (official build), VS Code extensions, Antigravity, Cherry
-           Studio, Google Drive mount, performance tweaks (sysctl, I/O
-           schedulers, noatime, ananicy-cpp, GameMode), kernel arguments,
-           GPU tooling, laptop power settings and, on a Framework laptop,
-           hibernation. Then a validation pass: every item
+           Ollama (official build), WoeUSB-ng, VS Code extensions,
+           Antigravity, Cherry Studio, Google Drive mount, performance
+           tweaks (sysctl, I/O schedulers, noatime, ananicy-cpp, GameMode),
+           kernel arguments, GPU tooling, laptop power settings and, on a
+           Framework laptop, hibernation. Then a validation pass: every item
            is checked, anything missing is retried once. Reboot.
   Stage 3  Configure and sign in ("Phase B"): checks that kernel arguments and
            services are live, GameMode's AMD GPU settings, variable refresh
@@ -188,6 +188,18 @@ SupplementaryGroups=render video
 """
 OLLAMA_API = "http://127.0.0.1:11434/api/version"
 
+
+# WoeUSB-ng: makes a bootable Windows installer USB stick from an ISO. Not
+# packaged for Fedora; installed as its README says (sudo pip3 install
+# WoeUSB-ng) on top of the Fedora packages in rpm-apps.txt. Its install puts
+# the GUI launcher in /usr/local/bin/woeusbgui (it asks for your password
+# through polkit), a menu entry and the polkit rule in /usr/share, and the
+# woeusb command in /usr/local/bin. A new Fedora Python version needs it
+# installed again; the check below notices, and stage 2 reinstalls it.
+WOEUSB_PYPI = "https://pypi.org/pypi/WoeUSB-ng/json"
+WOEUSB_GUI = Path("/usr/local/bin/woeusbgui")
+WOEUSB_POLICY = Path("/usr/share/polkit-1/actions/com.github.woeusb.woeusb-ng.policy")
+WOEUSB_TOOLS = ["7z", "parted", "mkntfs", "mkfs.fat", "grub2-install", "wipefs", "lsblk"]   # what it runs
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
 REPO_URLS = {
@@ -1735,6 +1747,7 @@ def stage2_install():
         ("Repositories", setup_repos),
         ("Codecs for this machine (RPM Fusion)", install_swaps),
         ("Packages", install_rpms),
+        ("WoeUSB-ng (Windows USB installer)", install_woeusb),
         ("Old Flatpak Steam cleanup", cleanup_flatpak_steam),
         ("Flatpak apps", install_flatpaks),
         ("AI command-line tools", install_cli_tools),
@@ -2393,6 +2406,50 @@ def ollama_service(restart=False):
         f"`ollama` is {shutil.which('ollama') or OLLAMA_BIN}")
 
 
+# ---------------------------------------------------------------- WoeUSB-ng
+
+def woeusb_version():
+    """Installed WoeUSB-ng version, as Fedora's python3 sees it ('' if it
+    isn't there or can't be imported)."""
+    r = run(["/usr/bin/python3", "-c", "import importlib.metadata as m, WoeUSB.core; "
+             "print(m.version('WoeUSB-ng'))"], changes_system=False)
+    return r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+
+
+def woeusb_published():
+    if "woeusb" not in FACTS:
+        try:
+            FACTS["woeusb"] = json.loads(output_of(["curl", "-fsSL", "--max-time", "30", WOEUSB_PYPI]))["info"]["version"]
+        except (ValueError, KeyError, TypeError):
+            FACTS["woeusb"] = ""
+    return FACTS["woeusb"]
+
+
+def woeusb_ready():
+    return bool(woeusb_version()) and WOEUSB_GUI.exists() and WOEUSB_POLICY.exists()
+
+
+def install_woeusb():
+    have, latest = woeusb_version(), woeusb_published()
+    section(f"WoeUSB-ng: PyPI has {latest or '(unknown)'}" + (f", {have} installed" if have else ""))
+    if woeusb_ready() and (not latest or version_key(have) >= version_key(latest)):
+        say("   up to date")
+    else:
+        # Fedora's python3-wxpython4 and python3-termcolor already satisfy its
+        # requirements, so pip only adds WoeUSB-ng itself (in /usr/local).
+        if run(["sudo", "/usr/bin/python3", "-m", "pip", "install", "--upgrade", "--root-user-action=ignore",
+                "--disable-pip-version-check", "WoeUSB-ng"]).returncode != 0:
+            failed("install WoeUSB-ng (pip)")
+            return
+        if not DRY_RUN and not woeusb_ready():
+            failed("WoeUSB-ng installed, but its launcher or polkit rule is missing",
+                   f"expected {WOEUSB_GUI} and {WOEUSB_POLICY}")
+            return
+    missing = [t for t in WOEUSB_TOOLS if not shutil.which(t)]
+    if missing and not DRY_RUN:
+        failed("WoeUSB-ng: commands it needs are missing", ", ".join(missing))
+
+
 # ---------------------------------------------------------------- Cherry Studio
 
 def parse_cherry_manifest(text):
@@ -3031,6 +3088,9 @@ def collect_checks(post_reboot):
     rows.append(("ollama", "ollama.service set to run the official build", Path(OLLAMA_DROPIN).exists()))
     rows.append(("ollama", "ollama.service serves the official build",
                  bool(ollama_have) and ollama_server_version() == ollama_have))
+    rows.append(("woeusb", "WoeUSB-ng (Windows USB installer) and its menu entry", woeusb_ready()))
+    rows.append(("woeusb", "commands WoeUSB-ng runs (7z, mkntfs, grub2-install, ...)",
+                 all(shutil.which(t) for t in WOEUSB_TOOLS)))
     cherry_ver = cherry_published()[0]
     cherry_have = output_of(["rpm", "-q", "--qf", "%{VERSION}", CHERRY_PACKAGE])
     rows.append(("cherry", f"Cherry Studio {cherry_ver}",
@@ -3128,6 +3188,7 @@ RETRY = {
     "vscode": install_vscode_extensions,
     "antigravity": install_antigravity,
     "cherry": install_cherry_studio,
+    "woeusb": install_woeusb,
     "ollama": install_ollama,
     "google": setup_google_drive,
     "browser": browser_extensions,

@@ -32,6 +32,17 @@ swtpm-tools             # swtpm setup tools
 edk2-ovmf               # UEFI firmware for VMs (Windows, and Claude Desktop's Cowork VM)
 virtio-win              # Windows VM drivers ISO (virtio-win repo)
 
+[Windows USB installer (WoeUSB-ng)]
+python3-wxpython4           # GUI toolkit WoeUSB-ng uses
+python3-termcolor           # WoeUSB-ng's coloured output
+python3-pip                 # installs WoeUSB-ng from PyPI (Fedora doesn't package it)
+parted                      # partitions the USB stick
+dosfstools                  # FAT32 (mkfs.fat)
+ntfs-3g                     # NTFS driver
+ntfsprogs                   # mkntfs: NTFS for Windows 11's install.wim (over FAT32's 4 GB limit)
+grub2-tools                 # grub2-install: makes the stick boot on legacy BIOS PCs
+grub2-pc-modules            # GRUB's legacy BIOS (i386-pc) files
+
 [Google Drive mount]
 rclone                  # mounts Google Drive at ~/GoogleDrive
 fuse3                   # lets rclone mount it as a normal folder
