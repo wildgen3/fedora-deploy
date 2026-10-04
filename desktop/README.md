@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/wildgen3/fedora-deploy/main/desktop
 |---|---|---|
 | 1. Clean base | Hardware detection, system update, firmware (pending updates listed, installed after you confirm; laptops must be on the charger), Flatpak updates | Reboot |
 | 2. Install (Phase A) | Core tools first (git, CLI, code tools), then repos, codec swaps, packages, old Flatpak Steam cleanup, Flatpaks, AI CLIs and SDKs, Ollama, WoeUSB-ng, VS Code extensions, Antigravity, Cherry Studio, Google Drive mount, performance tweaks, kernel arguments, GPU tooling, laptop power settings, Framework hibernation (swap file + resume). Then a validation pass that retries anything missing once. | Reboot |
-| 3. Configure and sign in (Phase B) | Checks that kernel arguments and daemons are live, GameMode AMD GPU settings, variable refresh rate, Phoronix Test Suite and MangoHud logging, lid close = hibernate (Framework) with a test, every sign-in, each app | To-do file on the Desktop |
+| 3. Configure and sign in (Phase B) | Checks that kernel arguments and daemons are live, GameMode AMD GPU settings, variable refresh rate, Phoronix Test Suite and MangoHud logging, lid close = hibernate (Framework) with a test, sign-in status, then every sign-in and app that's still open | To-do file on the Desktop |
 | 4. Baseline benchmarks (Phase C) | Runs `~/.config/desktop-postinstall/benchmarks.txt` at stock settings; results go to `~/benchmarks/<machine>/` | Offered at the end of stage 3, or `--benchmark` later |
 
 After each reboot, Konsole opens by itself once you log in and continues. You can also just run `python3 postinstall.py` again.
@@ -28,7 +28,7 @@ After each reboot, Konsole opens by itself once you log in and continues. You ca
 |---|---|
 | `--dry-run` | Print what would change |
 | `--check` | Validation table, including post-reboot checks (read-only) |
-| `--auth` | Sign-ins only; finished ones are skipped |
+| `--auth` | Sign-ins only: shows what's done and what's open, then asks once whether to skip everything that's done (Enter = skip) |
 | `--drive` | Google Drive only: add Google accounts, or sign one in again |
 | `--benchmark` | Stage 4 only |
 | `--stage N` | Run only stage 1–4 |
@@ -113,6 +113,7 @@ cat /sys/power/mem_sleep /sys/power/state; swapon --show; mokutil --sb-state
 
 ## Notes
 
+- **Sign-ins already done are skipped.** Stage 3 and `--auth` first list every sign-in as done or open, then ask once: Enter skips everything that's done, n goes through all of them again. Command-line sign-ins are checked directly (for example `gh auth status`, `claude auth status`, the Drive accounts' tokens). For apps, Chrome, Steam, Spotify and Obsidian are read from their own settings, Sunshine's admin login from its state file, and every other app counts as done once you've signed in and pressed Enter (remembered in `~/.local/state/desktop-postinstall/apps-done`).
 - **API keys** go in `~/.config/api-keys.env` (mode 600) and are loaded only by `agents`. Exported globally, they would make the Claude, Gemini and Codex CLIs bill the key instead of your subscription.
 - **Google Drive, several accounts:** at the sign-in step (or `--drive` later), give each Google account a short name such as `personal` or `work`. Your browser opens Google's sign-in for it; pick that account (Use another account if it isn't listed). Each one becomes its own rclone remote `gdrive-<name>`, mounted at `~/GoogleDrive/<name>` by `rclone-gdrive@<name>.service`, which starts with your session. The script then checks that the drive answers and shows which Google account it is signed in to. Run `--drive` again to add another account, or to sign one in again if Google stops accepting it. To remove one: `systemctl --user disable --now rclone-gdrive@<name>` and `rclone config delete gdrive-<name>`.
 - **Ollama:** Fedora's package stays installed and dnf keeps updating it, but it's far behind. The current official build runs instead: it's in `/usr/local` (as Ollama's own install.sh does it, without its NVIDIA driver steps), `/usr/local/bin/ollama` comes first in PATH, and the drop-in `/etc/systemd/system/ollama.service.d/20-official-build.conf` points Fedora's `ollama.service` at it, keeping Fedora's user, settings and models. dnf doesn't update the official build: each run of `--stage 2` upgrades it when GitHub has a newer release. To go back to Fedora's: `sudo rm /etc/systemd/system/ollama.service.d/20-official-build.conf /usr/local/bin/ollama && sudo rm -rf /usr/local/lib/ollama && sudo systemctl daemon-reload && sudo systemctl restart ollama`.

@@ -3248,6 +3248,7 @@ def stage3_configure():
         ("Benchmark tools (Phoronix Test Suite, MangoHud logging)", benchmark_tools_setup),
         ("Hibernation: lid action and test", hibernate_finish),
         ("Claude Desktop check (--doctor)", claude_desktop_doctor),
+        ("Sign-in status", signin_status),
         ("Sign-ins", signins),
         ("API keys for the agent SDKs", api_keys),
         ("Apps that need a sign-in", open_apps),
@@ -3338,20 +3339,24 @@ toggle_logging=Shift_L+F2
 # ---------------------------------------------------------------- sign-ins
 
 def signin(title, is_done, action, todo_text):
-    """One sign-in: skip if already done, else offer to run it now."""
+    """One sign-in: skip if already done (unless you chose to redo them),
+    else offer to run it now."""
     section(title)
     if DRY_RUN:
         say(f"   [dry-run] if not already done, would offer to run: {todo_text}")
         return
     if is_done():
-        say("   already done")
-        return
-    if yes("   Do this now?"):
-        action()
-        if is_done():
-            say("   done")
+        if not redo() or not yes("   Already done. Do it again?", default=False):
+            say("   already done")
             return
-        warn(f"{title} doesn't look finished")
+    elif not yes("   Do this now?"):
+        TODO.append(todo_text)
+        return
+    action()
+    if is_done():
+        say("   done")
+        return
+    warn(f"{title} doesn't look finished")
     TODO.append(todo_text)
 
 
@@ -3740,36 +3745,110 @@ def signins():
         signin(title, is_done, action, todo_text)
 
 
-APPS_PENDING_FILE = STATE_DIR / "apps-pending"   # app sign-ins skipped so far
+APPS_DONE_FILE = STATE_DIR / "apps-done"         # app sign-ins you confirmed
+APPS_PENDING_FILE = STATE_DIR / "apps-pending"   # earlier versions: app sign-ins skipped
 
 
-def apps_pending():
-    """Apps whose sign-in was skipped or not finished on an earlier run (an
-    app's own sign-in can't be checked from outside, so this is remembered)."""
-    known = {label for label, _, _ in SIGNIN_APPS}
+def json_file(path):
+    try:
+        return json.loads(Path(path).read_text(errors="replace"))
+    except (OSError, ValueError):
+        return {}
+
+
+# Apps whose sign-in shows in their own settings files. The rest are
+# remembered once you confirm them.
+FLATPAK_CONFIG = HOME / ".var/app"
+APP_SIGNIN_CHECKS = {
+    "Google Chrome": lambda: bool(json_file(HOME / ".config/google-chrome/Default/Preferences")
+                                  .get("account_info")),
+    "Steam": lambda: "AccountName" in read_sys(HOME / ".local/share/Steam/config/loginusers.vdf"),
+    "Spotify": lambda: "autologin." in read_sys(FLATPAK_CONFIG / "com.spotify.Client/config/spotify/prefs"),
+    "Obsidian": lambda: bool(json_file(FLATPAK_CONFIG / "md.obsidian.Obsidian/config/obsidian/obsidian.json")
+                             .get("vaults")),
+}
+# Added to SIGNIN_APPS after app sign-ins started being tracked as done, so
+# an earlier stage 3 never offered them.
+APPS_ADDED_SINCE = {"Cherry Studio"}
+SUNSHINE_STATE = HOME / ".config/sunshine/sunshine_state.json"   # holds the admin login once it's set
+
+
+def sunshine_admin_set():
+    return bool(json_file(SUNSHINE_STATE).get("username"))
+
+
+def apps_pending_before():
+    """Apps skipped on runs from before app sign-ins were tracked as done."""
     if APPS_PENDING_FILE.exists():
-        lines = read_sys(APPS_PENDING_FILE).splitlines()
+        return set(read_sys(APPS_PENDING_FILE).splitlines())
+    todo = read_sys(TODO_FILE)
+    return {label for label, _, what in SIGNIN_APPS if f"[ ] {label}: {what[:30]}" in todo}
+
+
+def apps_done():
+    """Apps already signed in: confirmed on an earlier run, or visible in the
+    app's own settings. A machine that finished stage 3 before this was
+    tracked counts every app it didn't skip as done."""
+    if APPS_DONE_FILE.exists():
+        done = set(read_sys(APPS_DONE_FILE).splitlines())
+    elif saved_stage() >= 4:
+        skipped = apps_pending_before() | APPS_ADDED_SINCE
+        done = {label for label, _, _ in SIGNIN_APPS if label not in skipped}
     else:
-        # Runs from before this was remembered: the Desktop to-do list has a
-        # line "label: sign-in text" for each app that was skipped.
-        todo = read_sys(TODO_FILE)
-        lines = [label for label, _, what in SIGNIN_APPS if f"[ ] {label}: {what[:30]}" in todo]
-    return [l for l in dict.fromkeys(lines) if l in known]
+        done = set()
+    return done | {label for label, check in APP_SIGNIN_CHECKS.items() if check()}
 
 
-def save_apps_pending(labels):
+def save_apps_done(labels):
     if DRY_RUN:
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    APPS_PENDING_FILE.write_text("".join(f"{l}\n" for l in labels))
+    known = [label for label, _, _ in SIGNIN_APPS if label in labels]
+    APPS_DONE_FILE.write_text("".join(f"{l}\n" for l in known))
+
+
+def installed_signin_apps():
+    return [label for label, ids, _ in SIGNIN_APPS if find_desktop_file(ids, label)]
+
+
+def apps_open():
+    done = apps_done()
+    return [label for label in installed_signin_apps() if label not in done]
 
 
 def open_signins():
-    """Everything still open: command-line sign-ins, skipped API keys, and
-    apps skipped before. Read-only."""
+    """Everything still open: command-line sign-ins, API keys not saved, and
+    installed apps not signed in yet. Read-only."""
     cli = [title for title, is_done, _, _ in signin_items() if not is_done()]
     keys = [var for var in API_KEYS if var not in read_api_keys()]
-    return cli, keys, apps_pending()
+    return cli, keys, apps_open()
+
+
+def signin_status():
+    """Every sign-in at a glance, then one question: skip the ones that are
+    already done? (Answer n to go through all of them again.)"""
+    keys = read_api_keys()
+    done_apps = apps_done()
+    rows = ([(title, is_done()) for title, is_done, _, _ in signin_items()]
+            + [(f"{var} (optional)", var in keys) for var in API_KEYS]
+            + [(f"{label} (app)", label in done_apps) for label in installed_signin_apps()]
+            + [("Sunshine admin login", sunshine_admin_set())])
+    for title, ok in rows:
+        say(f"   {'done' if ok else 'open':<5} {title}")
+    finished = sum(ok for _, ok in rows)
+    FACTS["redo_signins"] = False
+    if DRY_RUN or not finished:
+        return
+    if finished == len(rows):
+        question = "   Everything is signed in. Skip all of it?"
+    else:
+        question = f"   Skip the {finished} that are done and only do the {len(rows) - finished} open?"
+    FACTS["redo_signins"] = not yes(question)
+
+
+def redo():
+    """True when you chose to go through finished sign-ins again."""
+    return FACTS.get("redo_signins", False)
 
 
 def offer_open_signins():
@@ -3815,13 +3894,14 @@ def api_keys():
     keys = read_api_keys()
     changed = False
     for var, page in API_KEYS.items():
-        if var in keys:
+        if var in keys and not (redo() and not DRY_RUN
+                                and yes(f"-- {var} is saved. Replace it?", default=False)):
             section(f"{var}: already saved")
             continue
         if DRY_RUN:
             say(f"   [dry-run] would offer to open {page} and ask for {var} (hidden input)")
             continue
-        if not yes(f"-- Add {var}?", default=False):
+        if var not in keys and not yes(f"-- Add {var}?", default=False):
             TODO.append(f"(optional) API key: create one at {page}, then add {var}=... to {API_KEYS_FILE}")
             continue
         open_url(page)
@@ -3856,19 +3936,24 @@ def find_desktop_file(ids, label):
 
 
 def open_apps(only=None):
-    """Open each app that needs a sign-in (or only the `only` ones). Skipped
-    or unfinished ones are remembered and offered again on the next run."""
-    say("   Each app opens in turn. Sign in, then come back here and press Enter.")
-    say("   Type s then Enter to skip one (it's offered again next time you run this).")
-    pending = set(apps_pending())
-    for label, ids, what in SIGNIN_APPS:
-        if only is not None and label not in only:
-            continue
+    """Open each app that needs a sign-in (or only the `only` ones), skipping
+    the ones already done unless you chose to redo them. Confirmed ones are
+    remembered; skipped ones are offered again next time."""
+    done = apps_done()
+    todo = [(label, ids, what) for label, ids, what in SIGNIN_APPS
+            if (only is None or label in only) and (redo() or label not in done)]
+    for label in sorted(done):
+        if only is None or label in only:
+            if not redo():
+                say(f"   {label}: already signed in")
+    if todo:
+        say("   Each app opens in turn. Sign in, then come back here and press Enter.")
+        say("   Type s then Enter to skip one (it's offered again next time you run this).")
+    for label, ids, what in todo:
         section(f"{label}: {what}")
         if DRY_RUN:
             say(f"   [dry-run] would open {label} and wait for Enter")
             continue
-        pending.add(label)
         if ask("   Enter = open it, s = skip: ").lower() == "s":
             TODO.append(f"{label}: {what}")
             continue
@@ -3881,13 +3966,17 @@ def open_apps(only=None):
                          stderr=subprocess.DEVNULL, start_new_session=True)
         if ask("   Press Enter when done (s = not finished, add to to-do): ").lower() == "s":
             TODO.append(f"{label}: {what}")
+            done.discard(label)
         else:
-            pending.discard(label)
-    save_apps_pending([label for label, _, _ in SIGNIN_APPS if label in pending])
+            done.add(label)
+    save_apps_done(done)
     if only is not None:
         return
 
     section(f"Sunshine: create its admin username and password at {SUNSHINE_WEB_UI}")
+    if sunshine_admin_set() and not redo():
+        say("   already set")
+        return
     say("   (Your browser warns about the certificate: it's Sunshine's own, on this PC; continue.)")
     if DRY_RUN or yes("   Open it now?"):
         open_url(SUNSHINE_WEB_UI)
@@ -4105,6 +4194,7 @@ def main():
     try:
         if args.auth:
             banner("Sign-ins")
+            signin_status()
             signins()
             api_keys()
             open_apps()
