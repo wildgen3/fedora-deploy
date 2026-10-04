@@ -199,6 +199,12 @@ OLLAMA_API = "http://127.0.0.1:11434/api/version"
 WOEUSB_PYPI = "https://pypi.org/pypi/WoeUSB-ng/json"
 WOEUSB_GUI = Path("/usr/local/bin/woeusbgui")
 WOEUSB_POLICY = Path("/usr/share/polkit-1/actions/com.github.woeusb.woeusb-ng.policy")
+# Its installer copies these from pip's temporary build folder in /tmp with
+# shutil.copy2, which keeps their SELinux label (a /tmp file type). polkitd
+# may not read that, so the GUI's password prompt fails with an SELinux
+# alert. restorecon gives them the label their location should have.
+WOEUSB_SYSTEM_FILES = [WOEUSB_GUI, WOEUSB_POLICY, Path("/usr/share/applications/WoeUSB-ng.desktop"),
+                       Path("/usr/share/icons/WoeUSB-ng/icon.ico")]
 WOEUSB_TOOLS = ["7z", "parted", "mkntfs", "mkfs.fat", "grub2-install", "wipefs", "lsblk"]   # what it runs
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
@@ -2429,6 +2435,28 @@ def woeusb_ready():
     return bool(woeusb_version()) and WOEUSB_GUI.exists() and WOEUSB_POLICY.exists()
 
 
+def selinux_mislabeled(paths):
+    """Existing files whose SELinux label isn't the one their location should
+    have (empty when SELinux is off)."""
+    if not shutil.which("matchpathcon") or output_of(["getenforce"]) in ("", "Disabled"):
+        return []
+    return [p for p in paths if Path(p).exists()
+            and "verified" not in output_of(["matchpathcon", "-V", str(p)])]
+
+
+def woeusb_fix_labels():
+    wrong = selinux_mislabeled(WOEUSB_SYSTEM_FILES)
+    if not wrong:
+        return
+    say("   Fixing the SELinux labels of the files its installer copied from /tmp:")
+    if run(["sudo", "restorecon", "-Fv", *map(str, wrong)]).returncode != 0:
+        failed("restorecon on WoeUSB-ng's files")
+        return
+    if WOEUSB_POLICY in wrong:
+        # polkitd skipped the rule when it couldn't read it; reload it.
+        run(["sudo", "systemctl", "restart", "polkit.service"])
+
+
 def install_woeusb():
     have, latest = woeusb_version(), woeusb_published()
     section(f"WoeUSB-ng: PyPI has {latest or '(unknown)'}" + (f", {have} installed" if have else ""))
@@ -2445,6 +2473,7 @@ def install_woeusb():
             failed("WoeUSB-ng installed, but its launcher or polkit rule is missing",
                    f"expected {WOEUSB_GUI} and {WOEUSB_POLICY}")
             return
+    woeusb_fix_labels()
     missing = [t for t in WOEUSB_TOOLS if not shutil.which(t)]
     if missing and not DRY_RUN:
         failed("WoeUSB-ng: commands it needs are missing", ", ".join(missing))
@@ -3089,6 +3118,8 @@ def collect_checks(post_reboot):
     rows.append(("ollama", "ollama.service serves the official build",
                  bool(ollama_have) and ollama_server_version() == ollama_have))
     rows.append(("woeusb", "WoeUSB-ng (Windows USB installer) and its menu entry", woeusb_ready()))
+    rows.append(("woeusb", "WoeUSB-ng's files have the right SELinux labels",
+                 not selinux_mislabeled(WOEUSB_SYSTEM_FILES)))
     rows.append(("woeusb", "commands WoeUSB-ng runs (7z, mkntfs, grub2-install, ...)",
                  all(shutil.which(t) for t in WOEUSB_TOOLS)))
     cherry_ver = cherry_published()[0]
