@@ -8,6 +8,9 @@ cachyos-ananicy-rules   # CachyOS's rules database, used as-is (your overrides: 
 tuned                   # Fedora's power/performance profile daemon
 tuned-ppd               # lets KDE's power menu (Power Saver / Balanced / Performance) drive tuned
 
+[firewall]
+ufw                     # Uncomplicated Firewall: installed but left off; firewalld stays Fedora's active firewall (the two can't run together)
+
 [monitoring]
 lm_sensors              # CPU/board temperatures and fan speeds (feeds MangoHud and KDE widgets)
 powertop                # what draws power and what wakes the system; --csv output

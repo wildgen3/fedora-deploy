@@ -1,5 +1,8 @@
 # Apps from the vendors' own repos (added in stage 2) and Fedora.
 
+[Firefox]
+firefox                 # Firefox browser (Fedora's; Fedora KDE usually has it already)
+
 [Google Chrome]
 google-chrome-stable    # Chrome browser (Google's repo)
 

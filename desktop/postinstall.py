@@ -520,6 +520,14 @@ STREAMING_PORTS = {
     "Steam Remote Play": ["27036-27037/tcp", "27031-27036/udp"],
 }
 SUNSHINE_WEB_UI = "https://localhost:47990"
+# ufw is installed but stays off: firewalld is Fedora's firewall (libvirt,
+# podman and KDE's firewall settings use it), and two firewalls rewriting the
+# same nftables rules clash. ENABLED=yes here means ufw starts at boot.
+UFW_CONF = "/etc/ufw/ufw.conf"
+
+
+def ufw_enabled():
+    return bool(re.search(r"^\s*ENABLED\s*=\s*yes", read_sys(UFW_CONF), re.M | re.I))
 
 # ---- Google Drive and Google Docs
 
@@ -3046,7 +3054,15 @@ def setup_services():
         if run(["sudo", "usermod", "-aG", group, me]).returncode != 0:
             failed(f"add {me} to {group}")
 
-    if not succeeds(["systemctl", "is-active", "--quiet", "firewalld"]):
+    firewalld_on = succeeds(["systemctl", "is-active", "--quiet", "firewalld"])
+    if rpm_installed("ufw"):
+        if ufw_enabled() and firewalld_on:
+            warn("ufw and firewalld are both on; their rules clash. Keep one: "
+                 "`sudo ufw disable` (back to firewalld), or "
+                 "`sudo systemctl disable --now firewalld` (ufw only)")
+        elif not ufw_enabled():
+            say("   ufw: installed, off (firewalld is the active firewall)")
+    if not firewalld_on:
         say("   firewalld isn't running; no ports to open")
         return
     zone = output_of(["firewall-cmd", "--get-default-zone"])
@@ -3153,6 +3169,8 @@ def collect_checks(post_reboot):
             rows.append(("service", f"{unit} enabled", unit_enabled(unit)))
     for unit in USER_SERVICES:
         rows.append(("service", f"{unit} (user) enabled", unit_enabled(unit, user=True)))
+    rows.append(("service", "one firewall: firewalld on, ufw installed but off",
+                 unit_enabled("firewalld.service") and not ufw_enabled()))
     for group in GROUPS:
         try:
             grp.getgrnam(group)
