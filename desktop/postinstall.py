@@ -31,8 +31,9 @@ log in and carries on where it left off (or just run the same command again):
   Stage 3  Configure and sign in ("Phase B"): checks that kernel arguments and
            services are live, GameMode's AMD GPU settings, variable refresh
            rate, Phoronix Test Suite and MangoHud logging, lid-close hibernate
-           (Framework) with a test, then every sign-in, the Obsidian vault
-           and its plugins, then each app.
+           (Framework) with a test, then every sign-in, the Obsidian vault,
+           its plugins and their configuration (MCP for Claude Code and
+           Codex), then each app.
   Stage 4  Baseline benchmarks ("Phase C"): runs the list in
            ~/.config/desktop-postinstall/benchmarks.txt once at stock settings
            and saves the results under ~/benchmarks/<machine>/.
@@ -45,7 +46,7 @@ Options:
     --drive             Google Drive only: add Google accounts (each mounted at
                         ~/GoogleDrive/<name>), or sign one in again
     --obsidian          Obsidian only: the AppImage (and the move from the Flatpak),
-                        the vault and its plugins
+                        the vault, its plugins and their configuration
     --benchmark         stage 4 only
     --check             only the validation pass, including post-reboot checks (read-only)
     --verbose           print every command and its full output live
@@ -75,6 +76,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 from pathlib import Path
 import urllib.request
 from urllib.parse import unquote, urljoin
@@ -226,9 +228,13 @@ OBSIDIAN_VERSION_FILE = OBSIDIAN_DIR / ".version"
 OBSIDIAN_ICON = OBSIDIAN_DIR / "obsidian.png"
 OBSIDIAN_ICON_IN_APPIMAGE = "usr/share/icons/hicolor/512x512/apps/obsidian.png"
 OBSIDIAN_DESKTOP = HOME / ".local" / "share" / "applications" / "obsidian.desktop"
-# ~/.local/bin/obsidian is never created here: that name belongs to Obsidian's
-# own command-line tool, written when Settings > General > Command line
-# interface is turned on.
+# Obsidian's own command-line tool: the AppImage's obsidian-cli, copied to
+# ~/.local/bin/obsidian exactly as Obsidian's "Command line interface"
+# registration does it. Nothing else may use that name. The app only answers
+# it when "cli": true is in obsidian.json (Settings > General > Command line
+# interface), and it must be running.
+OBSIDIAN_CLI = HOME / ".local" / "bin" / "obsidian"
+OBSIDIAN_SETTINGS_JSON = HOME / ".config" / "obsidian" / "obsidian.json"
 OBSIDIAN_FLATPAK = "md.obsidian.Obsidian"
 OBSIDIAN_FLATPAK_CONFIG = HOME / ".var" / "app" / OBSIDIAN_FLATPAK / "config" / "obsidian"
 OBSIDIAN_CONFIG = HOME / ".config" / "obsidian"
@@ -263,33 +269,31 @@ VAULT_TOOL_FILES = [   # (path under vault-tools, where it goes, mode)
 VAULT_TIMER = "vault-sync.timer"
 VAULT_PLUGIN_LOCK = VAULT_DIR / "02 Agent" / "runbooks" / "obsidian-plugins.lock.json"
 
-# Things only you can do in Obsidian, printed by the vault step. No token or
-# key is ever shown or stored here: `read -rs` takes it without echoing it or
-# leaving it in your shell history.
-OBSIDIAN_STEPS = [
-    "Obsidian: Settings > Community plugins > Turn on community plugins (stored per machine).",
-    "Obsidian: Settings > General > Command line interface: on.",
-    "Obsidian, once per vault (it syncs): `vault-plugins enable agent-client terminal` "
-    "(needs the command line interface on, or Obsidian closed).",
-    "MCP, once and user-wide (a second registration with an old token in another scope causes 401 errors). "
-    "Vault Retrieval: `read -rs T && claude mcp add --scope user --transport http vault-retrieval "
-    "http://127.0.0.1:8123/mcp --header \"Authorization: Bearer $T\"; unset T` "
-    "(paste the token from Vault Retrieval's settings).",
-    "MCP, Local REST API: turn on its \"Enable Non-encrypted (HTTP) Server\" (127.0.0.1:27123), then "
-    "`read -rs T && claude mcp add --scope user --transport http obsidian http://127.0.0.1:27123/mcp/ "
-    "--header \"Authorization: Bearer $T\"; unset T` (paste the API key from Local REST API's settings).",
-    "MCP for Codex: the same two servers in ~/.codex/config.toml: [mcp_servers.vault-retrieval] with "
-    "url = \"http://127.0.0.1:8123/mcp\", and [mcp_servers.obsidian] with url = \"http://127.0.0.1:27123/mcp/\"; "
-    "each with http_headers = { Authorization = \"Bearer <its token>\" } typed into the file yourself.",
-    "MCP check: `claude mcp list` shows ✔ Connected for vault-retrieval and obsidian.",
-]
-# After the move from the Flatpak.
-OBSIDIAN_MOVED_STEPS = [
-    "Obsidian (moved from the Flatpak): open the vault and trust its plugins if asked.",
-    "Obsidian: Settings > General > Command line interface: on.",
-    "Obsidian (moved from the Flatpak): re-check the MCP registrations with `claude mcp list`; "
-    "plugin tokens kept in Obsidian's keychain may have changed with the move.",
-]
+# The configuration step (stage 3 and --obsidian) runs Obsidian and drives it
+# through its own CLI: community plugins on (restricted mode off), Agent Client
+# and Terminal on, the plugins' local servers on, and their MCP servers
+# registered for Claude Code and Codex. Tokens are read inside Obsidian (Vault
+# Retrieval keeps its token in Obsidian's keychain, per device) and go straight
+# into ~/.claude.json and ~/.codex/config.toml; they're never printed or logged.
+OBSIDIAN_LATE_PLUGINS = ["agent-client", "terminal"]   # off until Obsidian ran outside the Flatpak
+# MCP name: (plugin id, settings that turn its server on, port setting, token setting, URL path)
+OBSIDIAN_MCP = {
+    "vault-retrieval": ("vault-retrieval", {"mcpEnabled": True}, "mcpPort", "mcpToken", "/mcp"),
+    "obsidian": ("obsidian-local-rest-api", {"enableInsecureServer": True}, "insecurePort", "apiKey", "/mcp/"),
+}
+CODEX_CONFIG = HOME / ".codex" / "config.toml"
+# The same steps by hand, for any part the configuration step couldn't do.
+OBSIDIAN_MANUAL = {
+    "restrict": "Obsidian: Settings > Community plugins > Turn on community plugins (per machine).",
+    "cli": "Obsidian: Settings > General > Command line interface: on.",
+    "plugins": "Obsidian: `vault-plugins enable agent-client terminal` (command line interface on, or Obsidian closed).",
+    "vault-retrieval": "MCP: Vault Retrieval: turn on its MCP server, then `read -rs T && claude mcp add --scope user "
+                       "--transport http vault-retrieval http://127.0.0.1:8123/mcp --header \"Authorization: Bearer $T\"; "
+                       "unset T` (token from its settings); same server in ~/.codex/config.toml.",
+    "obsidian": "MCP: Local REST API: turn on \"Enable Non-encrypted (HTTP) Server\", then `read -rs T && claude mcp add "
+                "--scope user --transport http obsidian http://127.0.0.1:27123/mcp/ --header \"Authorization: Bearer $T\"; "
+                "unset T` (API key from its settings); same server in ~/.codex/config.toml.",
+}
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
 REPO_URLS = {
@@ -2680,6 +2684,7 @@ def install_obsidian():
             install_obsidian_appimage(ver, url, sha256)
     if OBSIDIAN_APPIMAGE.exists() or DRY_RUN:
         obsidian_launcher()
+        install_obsidian_cli()
         migrate_obsidian_flatpak()
     obsidian_host_tools()
 
@@ -2763,6 +2768,32 @@ Categories=Office;
         run(["xdg-mime", "default", OBSIDIAN_DESKTOP.name, "x-scheme-handler/obsidian"])
 
 
+def install_obsidian_cli():
+    """Obsidian's own CLI (the AppImage's obsidian-cli) at ~/.local/bin/obsidian,
+    the way its "Command line interface" registration installs it. Refreshed
+    when the AppImage brings a different one."""
+    section(f"Obsidian's command-line tool: {OBSIDIAN_CLI}")
+    if DRY_RUN:
+        say(f"   [dry-run] {OBSIDIAN_APPIMAGE} --appimage-extract obsidian-cli, installed as {OBSIDIAN_CLI}")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix=".cli-", dir=OBSIDIAN_DIR))
+    try:
+        r = run([str(OBSIDIAN_APPIMAGE), "--appimage-extract", "obsidian-cli"], cwd=tmp)
+        cli = tmp / "squashfs-root" / "obsidian-cli"
+        if r.returncode != 0 or not cli.is_file():
+            failed("Obsidian: couldn't take obsidian-cli out of the AppImage")
+            return
+        if OBSIDIAN_CLI.exists() and OBSIDIAN_CLI.read_bytes() == cli.read_bytes():
+            say("   already installed")
+            return
+        LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cli, OBSIDIAN_CLI)
+        OBSIDIAN_CLI.chmod(0o755)
+        say(f"   installed {OBSIDIAN_CLI}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def obsidian_flatpak_installation():
     """'user' or 'system' if the Obsidian Flatpak is installed, else ''."""
     for where in ("user", "system"):
@@ -2829,10 +2860,8 @@ def migrate_obsidian_flatpak():
     if run(cmd + (["--delete-data"] if delete else []) + [OBSIDIAN_FLATPAK]).returncode != 0:
         failed("remove the Obsidian Flatpak")
         return
-    say("   The Obsidian Flatpak is removed. Still to do in Obsidian:")
-    for n, step in enumerate(OBSIDIAN_MOVED_STEPS, 1):
-        say(f"     {n}. {step}")
-        TODO.append(step)
+    say("   The Obsidian Flatpak is removed. The configuration step (stage 3, or --obsidian) turns on")
+    say("   its command line interface, the plugins and their MCP servers in the AppImage.")
 
 
 def obsidian_host_tools():
@@ -2865,10 +2894,6 @@ def obsidian_vault():
     else:
         vault_bootstrap()
     vault_plugins()
-    section("Steps only you can do (also on the to-do list)")
-    for n, step in enumerate(OBSIDIAN_STEPS, 1):
-        say(f"   {n}. {step}")
-        TODO.append(step)
 
 
 def install_vault_tools(src):
@@ -2982,6 +3007,308 @@ def vault_plugins():
     say("   Something drifted; reinstalling from the lockfile")
     if run(["vault-plugins", "install"], env=env, live=True).returncode != 0:
         failed("vault-plugins install")
+
+
+# ---------------------------------------------------------------- Obsidian configuration
+
+def obsidian_running():
+    """Obsidian is running: the AppImage (it runs from a /tmp/.mount_Obsid...
+    folder) or the Flatpak (/app/obsidian)."""
+    return succeeds(["pgrep", "-f", r"\.mount_Obsid|Obsidian\.AppImage|" + OBSIDIAN_FLATPAK_PROCESS])
+
+
+def obsidian_cli(*args, private=False, timeout=60):
+    """Run Obsidian's CLI against the vault. private: its output (a token)
+    is neither logged nor shown."""
+    cmd = [str(OBSIDIAN_CLI), f"vault={VAULT_NAME}", *args]
+    shown = shlex.join(cmd[:3]) + (" <reads a setting; output hidden>" if private else
+                                   (" " + shlex.join(cmd[3:]) if cmd[3:] else ""))
+    log(f"$ {shown}")
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors="replace", timeout=timeout, cwd=HOME, env=tool_env())
+    except (OSError, subprocess.TimeoutExpired) as err:
+        r = subprocess.CompletedProcess(cmd, 1, "", str(err))
+    if not private:
+        for line in (r.stdout + r.stderr).splitlines():
+            log(f"  | {clip(line)}")
+    log(f"(exit code {r.returncode})")
+    return r
+
+
+def obsidian_cli_ready():
+    r = obsidian_cli("version", timeout=15)
+    out = r.stdout + r.stderr
+    return r.returncode == 0 and bool(re.search(r"\d+\.\d+", out)) and "not enabled" not in out
+
+
+def obsidian_eval(js, private=False):
+    """Run JavaScript inside Obsidian (CLI `eval`); returns the JSON its
+    result printed as `=> ...`, or None."""
+    r = obsidian_cli("eval", f"code={js}", private=private, timeout=120)
+    m = re.search(r"^=> (.*)$", r.stdout, re.M | re.S)
+    if r.returncode != 0 or not m:
+        return None
+    text = m.group(1).strip()
+    try:
+        value = json.loads(text)
+        return json.loads(value) if isinstance(value, str) else value
+    except ValueError:
+        return None
+
+
+def obsidian_settings_ready():
+    """obsidian.json has the CLI on and the vault registered."""
+    data = json_file(OBSIDIAN_SETTINGS_JSON)
+    vaults = data.get("vaults") or {}
+    return data.get("cli") is True and any(v.get("path") == str(VAULT_DIR) for v in vaults.values()
+                                           if isinstance(v, dict))
+
+
+def obsidian_prepare_settings():
+    """With Obsidian closed (it rewrites obsidian.json from memory): CLI on,
+    and the vault registered so Obsidian opens it."""
+    if obsidian_settings_ready():
+        return True
+    if obsidian_running():
+        if ask("   Obsidian is running. Close it so its settings can be changed, then press Enter "
+               "(s = skip the configuration for now): ").lower() == "s" or obsidian_running():
+            return False
+    data = json_file(OBSIDIAN_SETTINGS_JSON) or {}
+    data["cli"] = True
+    vaults = data.setdefault("vaults", {})
+    if not any(isinstance(v, dict) and v.get("path") == str(VAULT_DIR) for v in vaults.values()):
+        for v in vaults.values():
+            if isinstance(v, dict):
+                v.pop("open", None)
+        vaults[os.urandom(8).hex()] = {"path": str(VAULT_DIR), "ts": int(time.time() * 1000), "open": True}
+    write_user_file(OBSIDIAN_SETTINGS_JSON, json.dumps(data))
+    say("   obsidian.json: command line interface on, vault registered")
+    return True
+
+
+def obsidian_start():
+    """Start Obsidian (the AppImage) if its CLI doesn't answer yet, and wait
+    until it does."""
+    if obsidian_cli_ready():
+        return True
+    say("   Starting Obsidian...")
+    subprocess.Popen([str(OBSIDIAN_APPIMAGE), "--ozone-platform-hint=auto"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, env=tool_env())
+    for _ in range(45):
+        time.sleep(2)
+        if obsidian_cli_ready():
+            return True
+    return False
+
+
+def plugin_server_js(plugin, settings, port_key, token_key):
+    """JavaScript run inside Obsidian: turn the plugin's server on (only if
+    it's off), reload it if anything changed, and return port and token."""
+    return (
+        "(async () => { const id = %s, want = %s; let p = app.plugins.plugins[id];"
+        " if (!p) return JSON.stringify({missing: true}); let changed = false;"
+        " for (const [k, v] of Object.entries(want)) if (p.settings[k] !== v) { p.settings[k] = v; changed = true; }"
+        " if (changed) { await p.saveSettings(); await app.plugins.disablePlugin(id); await app.plugins.enablePlugin(id);"
+        " p = app.plugins.plugins[id]; }"
+        " return JSON.stringify({changed, port: p.settings[%s], token: p.settings[%s] || ''}); })()"
+        % (json.dumps(plugin), json.dumps(settings), json.dumps(port_key), json.dumps(token_key)))
+
+
+def claude_private(args, shown):
+    """Claude Code's CLI with a token in its arguments or output: only `shown`
+    and the exit code reach the log."""
+    log(f"$ {shown}")
+    try:
+        r = subprocess.run([claude_cmd(), *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors="replace", timeout=120, cwd=HOME, env=tool_env())
+    except (OSError, subprocess.TimeoutExpired) as err:
+        r = subprocess.CompletedProcess(args, 1, "", str(err))
+    log(f"(exit code {r.returncode})")
+    return r
+
+
+CLAUDE_JSON = HOME / ".claude.json"   # Claude Code's user and local MCP servers
+
+
+def claude_mcp_entries(name):
+    """{scope: entry} for an MCP server name in Claude Code's config, read
+    directly (no output to log): user, local (this home folder) and project
+    (~/.mcp.json)."""
+    data = json_file(CLAUDE_JSON)
+    found = {}
+    for scope, servers in (("user", data.get("mcpServers")),
+                           ("local", (data.get("projects") or {}).get(str(HOME), {}).get("mcpServers")),
+                           ("project", json_file(HOME / ".mcp.json").get("mcpServers"))):
+        if isinstance(servers, dict) and isinstance(servers.get(name), dict):
+            found[scope] = servers[name]
+    return found
+
+
+def register_claude_mcp(name, url, token):
+    """One MCP server for Claude Code, user-wide. An entry under the same name
+    in another scope (local/project) would shadow it with an old token
+    (401 errors), so it's removed after you confirm."""
+    entries = claude_mcp_entries(name)
+    for scope in ("local", "project"):
+        if scope in entries:
+            if not yes(f"   Claude Code also has '{name}' in its {scope} scope (it hides the user-wide one). Remove it?"):
+                TODO.append(f"MCP: remove the {scope}-scope '{name}': `claude mcp remove {name} -s {scope}`.")
+                return False
+            claude_private(["mcp", "remove", name, "-s", scope], f"claude mcp remove {name} -s {scope}")
+    user = entries.get("user", {})
+    if user.get("url") == url and (user.get("headers") or {}).get("Authorization") == f"Bearer {token}":
+        say(f"   Claude Code: {name} already registered")
+        return True
+    if user:
+        claude_private(["mcp", "remove", name, "-s", "user"], f"claude mcp remove {name} -s user")
+    r = claude_private(["mcp", "add", "--scope", "user", "--transport", "http", name, url,
+                        "--header", f"Authorization: Bearer {token}"],
+                       f"claude mcp add --scope user --transport http {name} {url} --header <hidden>")
+    if r.returncode != 0:
+        failed(f"Claude Code: register MCP server {name}", (r.stderr or r.stdout).replace(token, "<hidden>")[-600:])
+        return False
+    say(f"   Claude Code: {name} registered ({url})")
+    return True
+
+
+def set_codex_mcp(servers):
+    """The same servers in ~/.codex/config.toml (url + http_headers). Only
+    these tables are replaced; everything else in the file stays. Mode 600:
+    it holds the tokens."""
+    text = read_sys(CODEX_CONFIG)
+    try:
+        current = tomllib.loads(text).get("mcp_servers", {}) if text else {}
+    except tomllib.TOMLDecodeError as err:
+        failed(f"Codex: {CODEX_CONFIG} isn't valid TOML, so it was left alone", str(err))
+        return False
+    if all(current.get(n, {}).get("url") == url
+           and current.get(n, {}).get("http_headers", {}).get("Authorization") == f"Bearer {token}"
+           for n, (url, token) in servers.items()):
+        say(f"   Codex: {', '.join(servers)} already in {CODEX_CONFIG}")
+        return True
+    kept, skipping = [], False
+    for line in text.splitlines(keepends=True):
+        header = re.match(r"\s*\[+\s*([^\]]+?)\s*\]+", line)
+        if header:
+            parts = [p.strip().strip('"') for p in header.group(1).split(".")]
+            skipping = len(parts) >= 2 and parts[0] == "mcp_servers" and parts[1] in servers
+        if not skipping:
+            kept.append(line)
+    blocks = [f'[mcp_servers.{n}]\nurl = "{url}"\nhttp_headers = {{ Authorization = "Bearer {token}" }}\n'
+              for n, (url, token) in servers.items()]
+    new = "".join(kept).rstrip("\n") + ("\n\n" if kept else "") + "\n".join(blocks)
+    try:
+        tomllib.loads(new)
+    except tomllib.TOMLDecodeError as err:
+        failed("Codex: the updated config.toml wouldn't be valid TOML; left alone", str(err))
+        return False
+    write_user_file(CODEX_CONFIG, new, mode=0o600)
+    say(f"   Codex: {', '.join(servers)} set in {CODEX_CONFIG}")
+    return True
+
+
+def obsidian_ollama_models():
+    """Models Vault Retrieval's embedding endpoints use on this PC's Ollama
+    (read from its settings inside Obsidian; only URL and model)."""
+    js = ("JSON.stringify((app.plugins.plugins['vault-retrieval']?.settings.embeddingEndpoints || [])"
+          ".map(e => ({url: e.url, model: e.model})))")
+    endpoints = obsidian_eval(js) or []
+    return sorted({e.get("model") for e in endpoints if isinstance(e, dict) and e.get("model")
+                   and re.search(r"//(localhost|127\.0\.0\.1):11434", e.get("url") or "")})
+
+
+def obsidian_configure():
+    """Obsidian set up as far as it can be from outside: community plugins
+    on, Agent Client and Terminal on, the plugins' servers on, their MCP
+    servers registered for Claude Code and Codex, and the Ollama models
+    Vault Retrieval uses. Anything that can't be done goes on the to-do list
+    with the steps by hand."""
+    section("Obsidian configuration: plugins on, their servers on, MCP for Claude Code and Codex")
+    missing = [what for what, ok in (
+        ("the Obsidian AppImage", OBSIDIAN_APPIMAGE.exists()), ("Obsidian's CLI", OBSIDIAN_CLI.exists()),
+        ("the vault with its plugins", (VAULT_DIR / ".obsidian" / "plugins").is_dir()),
+        ("a desktop session", bool(os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"))))
+        if not ok]
+    if DRY_RUN:
+        say(f"   [dry-run] obsidian.json: \"cli\": true and {VAULT_DIR} registered (Obsidian closed first)")
+        say(f"   [dry-run] start Obsidian; {OBSIDIAN_CLI} vault={VAULT_NAME} plugins:restrict off")
+        say(f"   [dry-run] vault-plugins enable {' '.join(OBSIDIAN_LATE_PLUGINS)}")
+        for name, (plugin, settings, _, _, _) in OBSIDIAN_MCP.items():
+            say(f"   [dry-run] {plugin}: {', '.join(f'{k}={v}' for k, v in settings.items())}; "
+                f"MCP '{name}' for Claude Code (user scope) and Codex")
+        say("   [dry-run] ollama pull the models Vault Retrieval's embedding endpoints use")
+        return
+    if missing:
+        say(f"   Not yet: needs {', '.join(missing)}. Runs again with stage 3 or --obsidian.")
+        TODO.append(f"Obsidian: run `python3 {INSTALLED_COPY} --obsidian` once the vault has synced "
+                    "(it turns on the plugins and registers their MCP servers).")
+        return
+    if not obsidian_prepare_settings():
+        TODO.extend([OBSIDIAN_MANUAL["cli"], f"Obsidian: then `python3 {INSTALLED_COPY} --obsidian`."])
+        return
+    if not obsidian_start():
+        failed("Obsidian didn't answer its CLI within 90 s",
+               f"Start Obsidian, check Settings > General > Command line interface, then `{OBSIDIAN_CLI} version`.")
+        TODO.extend([OBSIDIAN_MANUAL["cli"], f"Obsidian: then `python3 {INSTALLED_COPY} --obsidian`."])
+        return
+    say("   Obsidian is running and answers its CLI. (If it asks whether you trust the vault's author, choose Trust.)")
+
+    section("community plugins (restricted mode off, this machine)")
+    state = obsidian_cli("plugins:restrict").stdout.strip()
+    if state.endswith("off"):
+        say("   already on")
+    elif "disabled" in obsidian_cli("plugins:restrict", "off").stdout:
+        time.sleep(5)   # Obsidian reloads its window
+        for _ in range(15):
+            if obsidian_cli_ready():
+                break
+            time.sleep(2)
+        say("   turned on")
+    else:
+        failed("Obsidian: turn on community plugins (plugins:restrict off)")
+        TODO.append(OBSIDIAN_MANUAL["restrict"])
+
+    section(f"plugins that need the AppImage: {', '.join(OBSIDIAN_LATE_PLUGINS)}")
+    enabled = obsidian_cli("plugins:enabled", "filter=community", "format=json").stdout
+    off = [p for p in OBSIDIAN_LATE_PLUGINS if f'"{p}"' not in enabled]
+    if not off:
+        say("   already on")
+    elif run(["vault-plugins", "enable", *off], env=tool_env()).returncode != 0:
+        for plugin in off:
+            if obsidian_cli("plugin:enable", f"id={plugin}", "filter=community").returncode != 0:
+                failed(f"Obsidian: enable {plugin}")
+                TODO.append(OBSIDIAN_MANUAL["plugins"])
+
+    section("plugin servers and MCP registrations (tokens stay hidden)")
+    codex = {}
+    for name, (plugin, settings, port_key, token_key, path) in OBSIDIAN_MCP.items():
+        info = obsidian_eval(plugin_server_js(plugin, settings, port_key, token_key), private=True)
+        if not info or info.get("missing") or not info.get("token") or not info.get("port"):
+            failed(f"Obsidian: {plugin}'s server or token isn't available",
+                   "The plugin isn't installed or enabled in the vault, or hasn't made its token yet.")
+            TODO.append(OBSIDIAN_MANUAL[name])
+            continue
+        url = f"http://127.0.0.1:{info['port']}{path}"
+        say(f"   {plugin}: server on at {url}" + (" (just turned on)" if info.get("changed") else ""))
+        if not register_claude_mcp(name, url, info["token"]):
+            TODO.append(OBSIDIAN_MANUAL[name])
+        codex[name] = (url, info["token"])
+    if codex:
+        set_codex_mcp(codex)
+    if shutil.which(claude_cmd()) or Path(claude_cmd()).exists():
+        listing = claude_private(["mcp", "list"], "claude mcp list").stdout
+        for name in codex:
+            line = next((l for l in listing.splitlines() if l.startswith(f"{name}:")), "")
+            say(f"   claude mcp list: {name}: " + ("connected" if "Connected" in line else "NOT connected"))
+
+    section("Ollama models Vault Retrieval uses")
+    have = output_of(["ollama", "list"])
+    for model in obsidian_ollama_models():
+        if model.split(":")[0] in have:
+            say(f"   {model}: already pulled")
+        elif run(["ollama", "pull", model], live=True).returncode != 0:
+            failed(f"ollama pull {model}")
 
 
 # ---------------------------------------------------------------- Google Drive
@@ -3671,6 +3998,10 @@ def verify_checks():
     rows.append(("live", "vhost-vsock for Cowork", vsock_ready()))
     if "laptop" in BLOCKS:
         rows.append(("live", "sleep mode s2idle", "[s2idle]" in read_sys("/sys/power/mem_sleep")))
+    if (VAULT_DIR / ".obsidian").is_dir():
+        rows.append(("live", "Obsidian command line interface on", json_file(OBSIDIAN_SETTINGS_JSON).get("cli") is True))
+        for name in OBSIDIAN_MCP:
+            rows.append(("live", f"MCP '{name}' registered for Claude Code (user)", "user" in claude_mcp_entries(name)))
     if "hibernate" in BLOCKS:
         rows.append(("live", "resume= / resume_offset= active", "resume_offset=" in read_sys("/proc/cmdline")))
         rows.append(("live", "hibernation swap file active", str(SWAP_FILE) in read_sys("/proc/swaps")))
@@ -3756,6 +4087,7 @@ def stage3_configure():
         ("Sign-ins", signins),
         ("API keys for the agent SDKs", api_keys),
         ("Obsidian vault and plugins", obsidian_vault),
+        ("Obsidian configuration (plugins, servers, MCP)", obsidian_configure),
         ("Apps that need a sign-in", open_apps),
         ("To-do list", write_todo),
     ])
@@ -4657,7 +4989,7 @@ def main():
     parser.add_argument("--drive", action="store_true",
                         help="Google Drive only: add Google accounts, or sign one in again")
     parser.add_argument("--obsidian", action="store_true",
-                        help="Obsidian only: the AppImage (and the move from the Flatpak), the vault and its plugins")
+                        help="Obsidian only: the AppImage (and the move from the Flatpak), the vault, its plugins and their configuration")
     parser.add_argument("--benchmark", action="store_true", help="baseline benchmarks only (stage 4)")
     parser.add_argument("--check", action="store_true", help="validation only, including post-reboot checks")
     parser.add_argument("--with", dest="with_", action="append", metavar="NAME[,NAME]",
@@ -4722,6 +5054,7 @@ def main():
             banner("Obsidian")
             install_obsidian()
             obsidian_vault()
+            obsidian_configure()
             write_todo()
             summary()
         elif args.benchmark:
