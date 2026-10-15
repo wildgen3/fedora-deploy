@@ -22,8 +22,8 @@ log in and carries on where it left off (or just run the same command again):
            firmware updates (listed first, installed after you confirm;
            laptops must be on the charger), Flatpak updates. Reboot.
   Stage 2  Install ("Phase A"): repos, packages, Flatpaks, AI CLIs and SDKs,
-           Ollama (official build), WoeUSB-ng, VS Code extensions,
-           Antigravity, Cherry Studio, Google Drive mount, performance
+           Ollama (official build), Obsidian (AppImage), WoeUSB-ng, VS Code
+           extensions, Antigravity, Cherry Studio, Google Drive mount, performance
            tweaks (sysctl, I/O schedulers, noatime, ananicy-cpp, GameMode),
            kernel arguments, GPU tooling, laptop power settings and, on a
            Framework laptop, hibernation. Then a validation pass: every item
@@ -31,7 +31,8 @@ log in and carries on where it left off (or just run the same command again):
   Stage 3  Configure and sign in ("Phase B"): checks that kernel arguments and
            services are live, GameMode's AMD GPU settings, variable refresh
            rate, Phoronix Test Suite and MangoHud logging, lid-close hibernate
-           (Framework) with a test, then every sign-in, then each app.
+           (Framework) with a test, then every sign-in, the Obsidian vault
+           and its plugins, then each app.
   Stage 4  Baseline benchmarks ("Phase C"): runs the list in
            ~/.config/desktop-postinstall/benchmarks.txt once at stock settings
            and saves the results under ~/benchmarks/<machine>/.
@@ -43,6 +44,8 @@ Options:
     --auth              sign-ins only (skips ones already done)
     --drive             Google Drive only: add Google accounts (each mounted at
                         ~/GoogleDrive/<name>), or sign one in again
+    --obsidian          Obsidian only: the AppImage (and the move from the Flatpak),
+                        the vault and its plugins
     --benchmark         stage 4 only
     --check             only the validation pass, including post-reboot checks (read-only)
     --verbose           print every command and its full output live
@@ -206,6 +209,87 @@ WOEUSB_POLICY = Path("/usr/share/polkit-1/actions/com.github.woeusb.woeusb-ng.po
 WOEUSB_SYSTEM_FILES = [WOEUSB_GUI, WOEUSB_POLICY, Path("/usr/share/applications/WoeUSB-ng.desktop"),
                        Path("/usr/share/icons/WoeUSB-ng/icon.ico")]
 WOEUSB_TOOLS = ["7z", "parted", "mkntfs", "mkfs.fat", "grub2-install", "wipefs", "lsblk"]   # what it runs
+
+# Obsidian: the official AppImage from its GitHub release, not the Flatpak.
+# Vault plugins such as Terminal and Agent Client start programs on this PC
+# (claude, codex, git, your shell). The Flatpak sandbox blocks that, and its
+# only workaround (--talk-name=org.freedesktop.Flatpak) is a full sandbox
+# escape; the Flatpak already had filesystem=home, so little protection is
+# lost. Every other app stays a Flatpak. Each run reads the latest release
+# from GitHub's API and checks the download against the asset's SHA-256
+# digest there; the AppImage is only replaced when a newer release exists
+# (Obsidian updates its own app files in between).
+OBSIDIAN_API = "https://api.github.com/repos/obsidianmd/obsidian-releases/releases/latest"
+OBSIDIAN_DIR = HOME / ".local" / "opt" / "obsidian"
+OBSIDIAN_APPIMAGE = OBSIDIAN_DIR / "Obsidian.AppImage"     # stable path for the menu entry
+OBSIDIAN_VERSION_FILE = OBSIDIAN_DIR / ".version"
+OBSIDIAN_ICON = OBSIDIAN_DIR / "obsidian.png"
+OBSIDIAN_ICON_IN_APPIMAGE = "usr/share/icons/hicolor/512x512/apps/obsidian.png"
+OBSIDIAN_DESKTOP = HOME / ".local" / "share" / "applications" / "obsidian.desktop"
+# ~/.local/bin/obsidian is never created here: that name belongs to Obsidian's
+# own command-line tool, written when Settings > General > Command line
+# interface is turned on.
+OBSIDIAN_FLATPAK = "md.obsidian.Obsidian"
+OBSIDIAN_FLATPAK_CONFIG = HOME / ".var" / "app" / OBSIDIAN_FLATPAK / "config" / "obsidian"
+OBSIDIAN_CONFIG = HOME / ".config" / "obsidian"
+# Copied from the Flatpak: vault list, window state, per-machine trust and
+# Restricted Mode, local storage. Left behind: lock files, caches, and app
+# updates Obsidian downloaded (*.asar), so the AppImage starts on its own.
+OBSIDIAN_COPY_SKIP = ["Singleton*", "Cache", "Code Cache", "GPUCache", "DawnCache", "DawnGraphiteCache",
+                      "DawnWebGPUCache", "GraphiteDawnCache", "GrShaderCache", "ShaderCache", "Crashpad",
+                      "*.asar", "*.asar.gz"]
+OBSIDIAN_FLATPAK_PROCESS = "^/app/obsidian"   # how the Flatpak's processes show up in pgrep -f
+# Vault Retrieval (and later the Typed Graph sidecar) embed notes with this.
+OLLAMA_EMBED_MODEL = "nomic-embed-text"
+
+# The Obsidian vault: in Google Drive, edited as an offline copy at
+# ~/_obsidian_vault (a Btrfs subvolume) that `vault-sync` (rclone bisync)
+# keeps in step from a systemd user timer. The vault's own tools live inside
+# it and are maintained there; this script only copies them into place on a
+# new machine and never changes anything inside the vault.
+VAULT_ACCOUNT = "wildgen3"                  # Drive account: rclone remote gdrive-wildgen3
+VAULT_NAME = "_obsidian_vault"
+VAULT_DIR = HOME / VAULT_NAME
+VAULT_REMOTE = f"gdrive-{VAULT_ACCOUNT}:{VAULT_NAME}"
+VAULT_TOOLS = Path("20 dev") / "cloud-linux" / "vault-tools"   # inside the vault
+VAULT_FILTER = HOME / ".config" / "rclone" / "obsidian-vault.filter"
+VAULT_TOOL_FILES = [   # (path under vault-tools, where it goes, mode)
+    ("bin/vault-sync", HOME / ".local" / "bin" / "vault-sync", 0o755),
+    ("bin/vault-plugins", HOME / ".local" / "bin" / "vault-plugins", 0o755),
+    ("config/obsidian-vault.filter", VAULT_FILTER, 0o644),
+    ("systemd/vault-sync.service", HOME / ".config" / "systemd" / "user" / "vault-sync.service", 0o644),
+    ("systemd/vault-sync.timer", HOME / ".config" / "systemd" / "user" / "vault-sync.timer", 0o644),
+]
+VAULT_TIMER = "vault-sync.timer"
+VAULT_PLUGIN_LOCK = VAULT_DIR / "02 Agent" / "runbooks" / "obsidian-plugins.lock.json"
+
+# Things only you can do in Obsidian, printed by the vault step. No token or
+# key is ever shown or stored here: `read -rs` takes it without echoing it or
+# leaving it in your shell history.
+OBSIDIAN_STEPS = [
+    "Obsidian: Settings > Community plugins > Turn on community plugins (stored per machine).",
+    "Obsidian: Settings > General > Command line interface: on.",
+    "Obsidian, once per vault (it syncs): `vault-plugins enable agent-client terminal` "
+    "(needs the command line interface on, or Obsidian closed).",
+    "MCP, once and user-wide (a second registration with an old token in another scope causes 401 errors). "
+    "Vault Retrieval: `read -rs T && claude mcp add --scope user --transport http vault-retrieval "
+    "http://127.0.0.1:8123/mcp --header \"Authorization: Bearer $T\"; unset T` "
+    "(paste the token from Vault Retrieval's settings).",
+    "MCP, Local REST API: turn on its \"Enable Non-encrypted (HTTP) Server\" (127.0.0.1:27123), then "
+    "`read -rs T && claude mcp add --scope user --transport http obsidian http://127.0.0.1:27123/mcp/ "
+    "--header \"Authorization: Bearer $T\"; unset T` (paste the API key from Local REST API's settings).",
+    "MCP for Codex: the same two servers in ~/.codex/config.toml: [mcp_servers.vault-retrieval] with "
+    "url = \"http://127.0.0.1:8123/mcp\", and [mcp_servers.obsidian] with url = \"http://127.0.0.1:27123/mcp/\"; "
+    "each with http_headers = { Authorization = \"Bearer <its token>\" } typed into the file yourself.",
+    "MCP check: `claude mcp list` shows ✔ Connected for vault-retrieval and obsidian.",
+]
+# After the move from the Flatpak.
+OBSIDIAN_MOVED_STEPS = [
+    "Obsidian (moved from the Flatpak): open the vault and trust its plugins if asked.",
+    "Obsidian: Settings > General > Command line interface: on.",
+    "Obsidian (moved from the Flatpak): re-check the MCP registrations with `claude mcp list`; "
+    "plugin tokens kept in Obsidian's keychain may have changed with the move.",
+]
 
 # .repo files the publisher hosts; downloaded as-is into /etc/yum.repos.d/.
 REPO_URLS = {
@@ -663,7 +747,8 @@ SIGNIN_APPS = [
     ("Steam", ["steam"],
      "Sign in. Settings > Compatibility: turn on Steam Play for all titles. "
      "Settings > Remote Play: turn it on."),
-    ("Obsidian", ["md.obsidian.Obsidian"], "Open or create a vault; sign in if you use Sync."),
+    ("Obsidian", ["obsidian", OBSIDIAN_FLATPAK],
+     f"Open the vault ({VAULT_DIR}) and trust its plugins if asked; sign in if you use Sync."),
 ]
 
 APP_DIRS = [HOME / ".local/share/flatpak/exports/share/applications",
@@ -812,7 +897,7 @@ def heartbeat(shown, started, last_output, stop):
             last_output[0] = datetime.datetime.now()
 
 
-def run(cmd, changes_system=True, input_text=None, env=None, live=False):
+def run(cmd, changes_system=True, input_text=None, env=None, live=False, cwd=None):
     """Run and log one command. Returns a CompletedProcess.
 
     changes_system=True: the command modifies something. With --dry-run it is
@@ -847,7 +932,7 @@ def run(cmd, changes_system=True, input_text=None, env=None, live=False):
     try:
         if input_text is not None:
             result = subprocess.run(cmd, input=input_text, capture_output=True, text=True,
-                                    errors="replace", env=env)
+                                    errors="replace", env=env, cwd=cwd)
             for line in (result.stdout + result.stderr).splitlines():
                 log(f"  | {clip(line)}")
         else:
@@ -855,7 +940,7 @@ def run(cmd, changes_system=True, input_text=None, env=None, live=False):
             # gets end-of-input instead). Output is read as it comes; \r
             # progress bars arrive as separate lines.
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, errors="replace", env=env)
+                                    stderr=subprocess.STDOUT, text=True, errors="replace", env=env, cwd=cwd)
             lines = []
             for line in proc.stdout:
                 line = line.rstrip("\n")
@@ -1766,6 +1851,7 @@ def stage2_install():
         ("Flatpak apps", install_flatpaks),
         ("AI command-line tools", install_cli_tools),
         ("Ollama (official build)", install_ollama),
+        ("Obsidian (official AppImage)", install_obsidian),
         ("Agent SDK environment", install_agent_sdks),
         ("Shell setup", install_shell_config),
         ("VS Code extensions", install_vscode_extensions),
@@ -2048,7 +2134,7 @@ def install_cli_tools():
     elif run(["bash", "-c", f"set -o pipefail; curl -fsSL {CLAUDE_INSTALLER} | bash"], env=env).returncode != 0:
         failed("install Claude Code")
 
-    section(f"Gemini CLI and Codex CLI (npm, into {NPM_PREFIX})")
+    section(f"npm tools: {', '.join(NPM_GLOBALS.values())} (into {NPM_PREFIX})")
     run(["npm", "config", "set", "prefix", str(NPM_PREFIX)], env=env)
     missing = [p for p, cmd in NPM_GLOBALS.items() if not have_tool(cmd)]
     for pkg in missing:
@@ -2545,6 +2631,357 @@ def install_cherry_studio():
             failed(f"install Cherry Studio {ver}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- Obsidian
+
+def obsidian_published():
+    """(version, AppImage URL, SHA-256) of the latest release, from GitHub's
+    API (the x86_64 AppImage, not the -arm64 one); None if it can't be read
+    or the asset carries no SHA-256 digest."""
+    if "obsidian" not in FACTS:
+        found = None
+        try:
+            data = json.loads(output_of(["curl", "-fsSL", "--max-time", "30", "-H",
+                                         "Accept: application/vnd.github+json", OBSIDIAN_API]) or "{}")
+        except ValueError:
+            data = {}
+        for asset in data.get("assets", []) if isinstance(data, dict) else []:
+            m = re.fullmatch(r"Obsidian-(\d+\.\d+\.\d+)\.AppImage", asset.get("name", ""))
+            digest = asset.get("digest") or ""
+            if m and digest.startswith("sha256:") and asset.get("browser_download_url"):
+                found = (m.group(1), asset["browser_download_url"], digest.split(":", 1)[1].lower())
+        FACTS["obsidian"] = found
+    return FACTS["obsidian"]
+
+
+def obsidian_installed_version():
+    return read_sys(OBSIDIAN_VERSION_FILE) if OBSIDIAN_APPIMAGE.exists() else ""
+
+
+def install_obsidian():
+    """Obsidian as the official AppImage, its menu entry, the move from the
+    Flatpak, and what the vault's plugins need on this PC."""
+    section("FUSE 2 (AppImages mount themselves with it)")
+    install_packages(["fuse-libs"], "fuse-libs")
+    published = obsidian_published()
+    have = obsidian_installed_version()
+    if not published:
+        failed("Obsidian: couldn't read the latest release from GitHub's API; nothing changed",
+               f"{OBSIDIAN_API} didn't answer, or its AppImage has no SHA-256 digest "
+               "(GitHub allows 60 unauthenticated API calls an hour). Run this again later.")
+    else:
+        ver, url, sha256 = published
+        section(f"Obsidian: GitHub's latest release is {ver} (official AppImage)")
+        if have and version_key(have) >= version_key(ver):
+            say(f"   {have} is installed in {OBSIDIAN_DIR}: up to date")
+        else:
+            say(f"   Installing {ver}" + (f" (replacing {have})" if have else ""))
+            install_obsidian_appimage(ver, url, sha256)
+    if OBSIDIAN_APPIMAGE.exists() or DRY_RUN:
+        obsidian_launcher()
+        migrate_obsidian_flatpak()
+    obsidian_host_tools()
+
+
+def install_obsidian_appimage(ver, url, sha256):
+    """Download to a temporary file next to the destination, check its
+    SHA-256 against GitHub's digest, then move it into place (a running
+    Obsidian keeps the old file until it restarts)."""
+    if DRY_RUN:
+        say(f"   [dry-run] download {url}")
+        say(f"   [dry-run] check its SHA-256 against GitHub's digest ({sha256[:16]}...), "
+            f"then install it as {OBSIDIAN_APPIMAGE}")
+        return
+    OBSIDIAN_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=".download-", dir=OBSIDIAN_DIR))
+    try:
+        part = tmp / Path(url).name
+        if run(["curl", "-fL", "--retry", "3", "-o", str(part), url]).returncode != 0:
+            failed("download Obsidian")
+            return
+        got = sha256_of(part)
+        if got != sha256:
+            failed("Obsidian: the download doesn't match GitHub's SHA-256 digest; not installed",
+                   f"{Path(url).name}\nexpected {sha256}\ngot      {got}")
+            return
+        say("   SHA-256 matches GitHub's digest")
+        part.chmod(0o755)
+        os.replace(part, OBSIDIAN_APPIMAGE)
+        OBSIDIAN_VERSION_FILE.write_text(f"{ver}\n")
+        OBSIDIAN_ICON.unlink(missing_ok=True)   # taken from the new AppImage below
+        say(f"   Installed Obsidian {ver} as {OBSIDIAN_APPIMAGE}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def obsidian_icon():
+    """Obsidian's icon, taken out of the AppImage (--appimage-extract needs no
+    FUSE). Falls back to the icon theme's name for it."""
+    if OBSIDIAN_ICON.exists():
+        return str(OBSIDIAN_ICON)
+    if DRY_RUN:
+        say(f"   [dry-run] {OBSIDIAN_APPIMAGE} --appimage-extract {OBSIDIAN_ICON_IN_APPIMAGE}, "
+            f"saved as {OBSIDIAN_ICON}")
+        return str(OBSIDIAN_ICON)
+    tmp = Path(tempfile.mkdtemp(prefix=".icon-", dir=OBSIDIAN_DIR))
+    try:
+        r = run([str(OBSIDIAN_APPIMAGE), "--appimage-extract", OBSIDIAN_ICON_IN_APPIMAGE], cwd=tmp)
+        icon = tmp / "squashfs-root" / OBSIDIAN_ICON_IN_APPIMAGE
+        if r.returncode == 0 and icon.is_file():
+            shutil.copyfile(icon, OBSIDIAN_ICON)
+            return str(OBSIDIAN_ICON)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    warn("couldn't take Obsidian's icon out of the AppImage; the menu uses the icon theme's")
+    return "obsidian"
+
+
+def obsidian_launcher():
+    """~/.local/share/applications/obsidian.desktop: native Wayland like the
+    Flatpak's launcher, and the handler for obsidian:// links."""
+    section("Obsidian menu entry and obsidian:// links")
+    exe = f'"{OBSIDIAN_APPIMAGE}"' if " " in str(OBSIDIAN_APPIMAGE) else str(OBSIDIAN_APPIMAGE)
+    content = f"""\
+[Desktop Entry]
+Type=Application
+Name=Obsidian
+Comment={" ".join(filter(None, ["Obsidian", obsidian_installed_version()]))} (official AppImage, installed by {SCRIPT})
+Exec={exe} --ozone-platform-hint=auto %U
+Icon={obsidian_icon()}
+Terminal=false
+MimeType=x-scheme-handler/obsidian;
+StartupWMClass=obsidian
+Categories=Office;
+"""
+    if read_sys(OBSIDIAN_DESKTOP) == content.strip():
+        say(f"   {OBSIDIAN_DESKTOP}: already up to date")
+    else:
+        write_user_file(OBSIDIAN_DESKTOP, content)
+        run(["update-desktop-database", str(OBSIDIAN_DESKTOP.parent)])
+    if output_of(["xdg-mime", "query", "default", "x-scheme-handler/obsidian"]) != OBSIDIAN_DESKTOP.name:
+        run(["xdg-mime", "default", OBSIDIAN_DESKTOP.name, "x-scheme-handler/obsidian"])
+
+
+def obsidian_flatpak_installation():
+    """'user' or 'system' if the Obsidian Flatpak is installed, else ''."""
+    for where in ("user", "system"):
+        if succeeds(["flatpak", "info", f"--{where}", OBSIDIAN_FLATPAK]):
+            return where
+    return ""
+
+
+def copy_obsidian_settings():
+    """The Flatpak's app settings to ~/.config/obsidian, only if that doesn't
+    exist yet. Returns False if the copy failed."""
+    if OBSIDIAN_CONFIG.exists():
+        say(f"   {OBSIDIAN_CONFIG} already exists; the Flatpak's settings aren't copied over it")
+        return True
+    if not OBSIDIAN_FLATPAK_CONFIG.is_dir():
+        say("   The Flatpak has no settings to copy")
+        return True
+    if DRY_RUN:
+        say(f"   [dry-run] copy {OBSIDIAN_FLATPAK_CONFIG} to {OBSIDIAN_CONFIG} "
+            f"(without {', '.join(OBSIDIAN_COPY_SKIP)})")
+        return True
+    try:
+        shutil.copytree(OBSIDIAN_FLATPAK_CONFIG, OBSIDIAN_CONFIG, symlinks=True,
+                        ignore=shutil.ignore_patterns(*OBSIDIAN_COPY_SKIP))
+    except (OSError, shutil.Error) as err:
+        shutil.rmtree(OBSIDIAN_CONFIG, ignore_errors=True)   # no half copy left behind
+        failed("Obsidian: copy the Flatpak's settings", str(err))
+        return False
+    say(f"   Copied the Flatpak's settings (vault list, window state, trust, local storage) to {OBSIDIAN_CONFIG}")
+    return True
+
+
+def migrate_obsidian_flatpak():
+    """From the Obsidian Flatpak to the AppImage: its settings move over, then
+    the Flatpak goes. The vault itself (~/_obsidian_vault) isn't touched."""
+    where = obsidian_flatpak_installation()
+    if not where:
+        if OBSIDIAN_FLATPAK_CONFIG.is_dir() and not OBSIDIAN_CONFIG.exists():
+            section("Obsidian: settings left behind by a removed Flatpak")
+            copy_obsidian_settings()
+        return
+    section(f"Moving from the Obsidian Flatpak ({where} installation)")
+    if not DRY_RUN:
+        while succeeds(["pgrep", "-f", OBSIDIAN_FLATPAK_PROCESS]):
+            if ask("   Obsidian (the Flatpak) is running. Close it, then press Enter "
+                   "(s = move it another time): ").lower() == "s":
+                TODO.append(f"Obsidian: close the Flatpak, then run `python3 {INSTALLED_COPY} --obsidian` "
+                            "to finish moving to the AppImage.")
+                skipped("moving from the Obsidian Flatpak (it was still running)")
+                return
+    if not copy_obsidian_settings():
+        say("   The Flatpak stays installed until its settings are copied.")
+        return
+    data = HOME / ".var" / "app" / OBSIDIAN_FLATPAK
+    if DRY_RUN:
+        say(f"   [dry-run] would ask whether to delete the Flatpak's own data ({data}) as well")
+        delete = False
+    else:
+        delete = yes(f"   Also delete the Flatpak's own data in {data}? "
+                     f"Your vault ({VAULT_DIR}) isn't touched.", default=False)
+    cmd = ["flatpak", "uninstall", f"--{where}", "-y", "--noninteractive"]
+    if where == "system":
+        cmd = ["sudo", *cmd]
+    if run(cmd + (["--delete-data"] if delete else []) + [OBSIDIAN_FLATPAK]).returncode != 0:
+        failed("remove the Obsidian Flatpak")
+        return
+    say("   The Obsidian Flatpak is removed. Still to do in Obsidian:")
+    for n, step in enumerate(OBSIDIAN_MOVED_STEPS, 1):
+        say(f"     {n}. {step}")
+        TODO.append(step)
+
+
+def obsidian_host_tools():
+    """What the vault's plugins start or call on this PC."""
+    section(f"For the vault's plugins: Ollama with {OLLAMA_EMBED_MODEL} (Vault Retrieval's local index)")
+    if not DRY_RUN and not ollama_server_version():
+        warn(f"Ollama isn't answering on localhost:11434, so {OLLAMA_EMBED_MODEL} wasn't pulled")
+        TODO.append(f"Ollama: start it (`sudo systemctl start ollama`), then `ollama pull {OLLAMA_EMBED_MODEL}`.")
+    elif OLLAMA_EMBED_MODEL in output_of(["ollama", "list"]):
+        say(f"   {OLLAMA_EMBED_MODEL}: already pulled")
+    elif run(["ollama", "pull", OLLAMA_EMBED_MODEL], live=True).returncode != 0:
+        failed(f"ollama pull {OLLAMA_EMBED_MODEL}")
+    section("Programs the plugins start")
+    for cmd, what in (("python3", "Terminal's built-in terminal"), ("git", "the vault's tools"),
+                      ("node", "Agent Client's ACP adapters"),
+                      ("claude-agent-acp", "Agent Client: Claude Code (npm.txt)"),
+                      ("codex-acp", "Agent Client: Codex (npm.txt)"),
+                      ("claude", "Claude Code"), ("codex", "Codex CLI")):
+        say(f"   {cmd}: {'found' if have_tool(cmd) else 'MISSING'} ({what})")
+
+
+def obsidian_vault():
+    """Stage 3, after the Drive sign-in: the vault's offline copy and its
+    sync, the vault's tools, the plugin check, then what only you can do."""
+    section(f"Obsidian vault: {VAULT_DIR}, synced with {VAULT_REMOTE}")
+    if VAULT_DIR.exists():
+        say("   already there")
+        install_vault_tools(VAULT_DIR / VAULT_TOOLS)
+        vault_timer()
+    else:
+        vault_bootstrap()
+    vault_plugins()
+    section("Steps only you can do (also on the to-do list)")
+    for n, step in enumerate(OBSIDIAN_STEPS, 1):
+        say(f"   {n}. {step}")
+        TODO.append(step)
+
+
+def install_vault_tools(src):
+    """Copy the vault's tools into place: only ones that are missing. A copy
+    that differs from the vault's is left alone and reported; the vault
+    session maintains them. Never .git, never a symlink into the vault."""
+    if not src.is_dir() and not DRY_RUN:
+        failed("vault tools: not found", str(src))
+        return False
+    wrote = False
+    for rel, dest, mode in VAULT_TOOL_FILES:
+        source = src / rel
+        if dest.exists():
+            if source.exists() and source.read_bytes() != dest.read_bytes():
+                say(f"   {dest}: differs from the vault's copy; left as is")
+            continue
+        if not source.exists() and not DRY_RUN:
+            failed(f"vault tools: {rel} isn't in {src}")
+            continue
+        write_user_file(dest, source.read_text() if source.exists() else "", mode)
+        wrote = True
+    if wrote:
+        run(["systemctl", "--user", "daemon-reload"])
+    return True
+
+
+def vault_timer():
+    """vault-sync every 15 minutes (2 minutes after login first)."""
+    if unit_enabled(VAULT_TIMER, user=True):
+        say(f"   {VAULT_TIMER}: enabled")
+    elif unit_exists(VAULT_TIMER, user=True) or DRY_RUN:
+        if run(["systemctl", "--user", "enable", "--now", VAULT_TIMER]).returncode != 0:
+            failed(f"enable {VAULT_TIMER}")
+    else:
+        failed(f"{VAULT_TIMER}: not installed")
+
+
+def vault_bootstrap():
+    """A new machine: the vault's subvolume, its tools from the Drive mount,
+    a dry run of the first sync, and that sync only after you confirm. Kept
+    small: a vault-bootstrap script in the vault will take this over."""
+    tools = GDRIVE_DIR / VAULT_ACCOUNT / VAULT_NAME / VAULT_TOOLS
+    account = gdrive_accounts().get(VAULT_ACCOUNT, {})
+    if not DRY_RUN and not account.get("token"):
+        say(f"   Google Drive account '{VAULT_ACCOUNT}' isn't signed in, so the vault isn't set up.")
+        TODO.append(f"Obsidian vault: sign in Google Drive as '{VAULT_ACCOUNT}' (`python3 {INSTALLED_COPY} "
+                    f"--drive`), then `python3 {INSTALLED_COPY} --obsidian`.")
+        return
+    if not DRY_RUN and not tools.is_dir():
+        say(f"   The vault's tools aren't reachable at {tools} (is the Drive mounted?).")
+        TODO.append(f"Obsidian vault: check {GDRIVE_DIR / VAULT_ACCOUNT} is mounted, then "
+                    f"`python3 {INSTALLED_COPY} --obsidian`.")
+        return
+    if not DRY_RUN and output_of(["findmnt", "-no", "FSTYPE", "-T", str(HOME)]) != "btrfs":
+        skipped(f"Obsidian vault: {HOME} isn't on Btrfs, so it can't be a subvolume")
+        return
+    say(f"   Not on this machine yet. Steps: Btrfs subvolume {VAULT_DIR}, the vault's tools from")
+    say(f"   {tools}, RCLONE_TEST, a dry run of the first sync, then (after you confirm)")
+    say(f"   `vault-sync --resync` and {VAULT_TIMER}.")
+    if not DRY_RUN and not yes("   Set up the vault on this machine now?"):
+        TODO.append(f"Obsidian vault: `python3 {INSTALLED_COPY} --obsidian` when you want it on this machine.")
+        return
+    if run(["btrfs", "subvolume", "create", str(VAULT_DIR)]).returncode != 0:
+        failed(f"create the Btrfs subvolume {VAULT_DIR}")
+        return
+    if not install_vault_tools(tools):
+        return
+    if run(["rclone", "copyto", f"{VAULT_REMOTE}/RCLONE_TEST", str(VAULT_DIR / "RCLONE_TEST")]).returncode != 0:
+        failed("copy the vault's RCLONE_TEST marker from Google Drive")
+        return
+    section("First sync: dry run")
+    preview = ["rclone", "bisync", str(VAULT_DIR), VAULT_REMOTE, "--resync", "--dry-run",
+               "--filters-file", str(VAULT_FILTER)]
+    if DRY_RUN:
+        say(f"   [dry-run] {shlex.join(preview)}")
+        say("   [dry-run] then, after you confirm: vault-sync --resync, and enable " + VAULT_TIMER)
+        return
+    r = run(preview, changes_system=False)
+    if r.returncode != 0:
+        failed("the first sync's dry run failed; nothing was synced", error_text(r))
+        TODO.append(f"Obsidian vault: first sync not done; check `{shlex.join(preview)}`, then `vault-sync --resync`.")
+        return
+    copies = sum("Skipped copy" in line for line in r.stdout.splitlines())
+    say(f"   The first sync would copy {copies} file(s); nothing is deleted on a first (--resync) sync.")
+    if not yes("   Run the first sync now (vault-sync --resync)?"):
+        TODO.append(f"Obsidian vault: `vault-sync --resync`, then `systemctl --user enable --now {VAULT_TIMER}`.")
+        return
+    if run([str(LOCAL_BIN / "vault-sync"), "--resync"], env=tool_env(), live=True).returncode != 0:
+        failed("vault-sync --resync")
+        return
+    run(["systemctl", "--user", "daemon-reload"])
+    vault_timer()
+
+
+def vault_plugins():
+    """The vault's community plugins arrive with the sync, pinned by hash in
+    its lockfile. This only checks them, and reinstalls from the lockfile if
+    anything drifted; it never downloads plugins itself."""
+    section("Vault plugins: check against the lockfile (vault-plugins)")
+    if not DRY_RUN and not VAULT_PLUGIN_LOCK.exists():
+        say(f"   {VAULT_PLUGIN_LOCK} isn't here yet (the vault hasn't synced); skipped")
+        return
+    if not DRY_RUN and not have_tool("vault-plugins"):
+        failed("vault-plugins isn't installed (it comes with the vault's tools)")
+        return
+    env = tool_env()
+    if run(["vault-plugins", "verify"], env=env, live=True).returncode == 0:
+        if not DRY_RUN:
+            say("   plugins match the lockfile")
+        return
+    say("   Something drifted; reinstalling from the lockfile")
+    if run(["vault-plugins", "install"], env=env, live=True).returncode != 0:
+        failed("vault-plugins install")
 
 
 # ---------------------------------------------------------------- Google Drive
@@ -3103,9 +3540,11 @@ def collect_checks(post_reboot):
 
     env = tool_env()
     for cmd in ["claude", *NPM_GLOBALS.values(), *UV_TOOLS.values(), "gcloud", "code", "uv", "node"]:
-        # hf has no --version; its help screen proves it runs.
+        # hf has no --version; its help screen proves it runs. ACP adapters
+        # (*-acp) are servers that talk over stdin: present is enough.
         probe = "--help" if cmd == "hf" else "--version"
-        ok = have_tool(cmd) and run([cmd, probe], changes_system=False, env=env).returncode == 0
+        ok = have_tool(cmd) and (cmd.endswith("-acp")
+                                 or run([cmd, probe], changes_system=False, env=env).returncode == 0)
         rows.append(("cli", cmd, ok))
 
     python = AGENTS_VENV / "bin" / "python"
@@ -3138,6 +3577,20 @@ def collect_checks(post_reboot):
                  not selinux_mislabeled(WOEUSB_SYSTEM_FILES)))
     rows.append(("woeusb", "commands WoeUSB-ng runs (7z, mkntfs, grub2-install, ...)",
                  all(shutil.which(t) for t in WOEUSB_TOOLS)))
+    obsidian = obsidian_published()
+    have_obsidian = obsidian_installed_version()
+    if obsidian:
+        rows.append(("obsidian", f"Obsidian {obsidian[0]} (official AppImage)",
+                     bool(have_obsidian) and version_key(have_obsidian) >= version_key(obsidian[0])))
+    else:
+        rows.append(("obsidian", "Obsidian AppImage (latest release unknown)", bool(have_obsidian)))
+    rows.append(("obsidian", "Obsidian menu entry (obsidian.desktop)",
+                 str(OBSIDIAN_APPIMAGE) in read_sys(OBSIDIAN_DESKTOP)))
+    rows.append(("obsidian", "no Obsidian Flatpak", not obsidian_flatpak_installation()))
+    rows.append(("obsidian", f"Ollama model {OLLAMA_EMBED_MODEL} (Vault Retrieval)",
+                 OLLAMA_EMBED_MODEL in output_of(["ollama", "list"])))
+    if VAULT_DIR.exists():
+        rows.append(("vault", f"{VAULT_TIMER} enabled", unit_enabled(VAULT_TIMER, user=True)))
     cherry_ver = cherry_published()[0]
     cherry_have = output_of(["rpm", "-q", "--qf", "%{VERSION}", CHERRY_PACKAGE])
     rows.append(("cherry", f"Cherry Studio {cherry_ver}",
@@ -3237,6 +3690,8 @@ RETRY = {
     "vscode": install_vscode_extensions,
     "antigravity": install_antigravity,
     "cherry": install_cherry_studio,
+    "obsidian": install_obsidian,
+    "vault": vault_timer,
     "woeusb": install_woeusb,
     "ollama": install_ollama,
     "google": setup_google_drive,
@@ -3300,6 +3755,7 @@ def stage3_configure():
         ("Sign-in status", signin_status),
         ("Sign-ins", signins),
         ("API keys for the agent SDKs", api_keys),
+        ("Obsidian vault and plugins", obsidian_vault),
         ("Apps that need a sign-in", open_apps),
         ("To-do list", write_todo),
     ])
@@ -3813,9 +4269,17 @@ APP_SIGNIN_CHECKS = {
                                   .get("account_info")),
     "Steam": lambda: "AccountName" in read_sys(HOME / ".local/share/Steam/config/loginusers.vdf"),
     "Spotify": lambda: "autologin." in read_sys(FLATPAK_CONFIG / "com.spotify.Client/config/spotify/prefs"),
-    "Obsidian": lambda: bool(json_file(FLATPAK_CONFIG / "md.obsidian.Obsidian/config/obsidian/obsidian.json")
-                             .get("vaults")),
+    "Obsidian": lambda: bool(json_file(obsidian_settings_file()).get("vaults")),
 }
+
+
+def obsidian_settings_file():
+    """The AppImage's obsidian.json; the Flatpak's only while the Flatpak is
+    still installed and the AppImage has none yet."""
+    native = OBSIDIAN_CONFIG / "obsidian.json"
+    flatpak = any((d / OBSIDIAN_FLATPAK).exists()
+                  for d in (HOME / ".local/share/flatpak/app", Path("/var/lib/flatpak/app")))
+    return OBSIDIAN_FLATPAK_CONFIG / "obsidian.json" if flatpak and not native.exists() else native
 # Added to SIGNIN_APPS after app sign-ins started being tracked as done, so
 # an earlier stage 3 never offered them.
 APPS_ADDED_SINCE = {"Cherry Studio"}
@@ -4192,6 +4656,8 @@ def main():
     parser.add_argument("--auth", action="store_true", help="sign-ins only")
     parser.add_argument("--drive", action="store_true",
                         help="Google Drive only: add Google accounts, or sign one in again")
+    parser.add_argument("--obsidian", action="store_true",
+                        help="Obsidian only: the AppImage (and the move from the Flatpak), the vault and its plugins")
     parser.add_argument("--benchmark", action="store_true", help="baseline benchmarks only (stage 4)")
     parser.add_argument("--check", action="store_true", help="validation only, including post-reboot checks")
     parser.add_argument("--with", dest="with_", action="append", metavar="NAME[,NAME]",
@@ -4252,6 +4718,12 @@ def main():
             banner("Google Drive accounts")
             gdrive_login()
             write_todo()
+        elif args.obsidian:
+            banner("Obsidian")
+            install_obsidian()
+            obsidian_vault()
+            write_todo()
+            summary()
         elif args.benchmark:
             stage4_baseline()
         elif DRY_RUN:

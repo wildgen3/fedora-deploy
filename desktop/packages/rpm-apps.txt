@@ -46,6 +46,9 @@ ntfsprogs                   # mkntfs: NTFS for Windows 11's install.wim (over FA
 grub2-tools                 # grub2-install: makes the stick boot on legacy BIOS PCs
 grub2-pc-modules            # GRUB's legacy BIOS (i386-pc) files
 
+[Obsidian (AppImage)]
+fuse-libs               # FUSE 2: AppImages (Obsidian) mount themselves with it
+
 [Google Drive mount]
 rclone                  # mounts Google Drive at ~/GoogleDrive
 fuse3                   # lets rclone mount it as a normal folder

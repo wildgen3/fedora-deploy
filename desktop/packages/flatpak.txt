@@ -1,10 +1,10 @@
 # Flathub apps, installed for your user. Steam is the RPM Fusion package
-# (rpm-gaming.txt), not a Flatpak.
+# (rpm-gaming.txt), not a Flatpak. Obsidian is the official AppImage instead
+# (postinstall.py): its plugins start programs on this PC, which the sandbox blocks.
 
 [apps]
 com.discordapp.Discord          # Discord
 com.spotify.Client              # Spotify
-md.obsidian.Obsidian            # Obsidian: notes
 com.orcaslicer.OrcaSlicer       # OrcaSlicer: filament 3D printers
 io.mango3d.LycheeSlicer         # Lychee Slicer: resin 3D printers
 

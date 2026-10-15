@@ -4,3 +4,7 @@
 [AI CLIs]
 @google/gemini-cli      gemini      # Gemini CLI
 @openai/codex           codex       # Codex CLI
+
+[ACP adapters for Obsidian's Agent Client plugin]
+@agentclientprotocol/claude-agent-acp   claude-agent-acp   # Claude Code over ACP (Agent Client's documented package)
+@agentclientprotocol/codex-acp          codex-acp          # Codex over ACP (Agent Client's documented package)
